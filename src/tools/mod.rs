@@ -30,7 +30,8 @@ pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
 pub mod delegate_coordination_status;
-pub mod docx_read;
+#[cfg(feature = "channel-lark")]
+pub mod feishu_doc;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -97,6 +98,8 @@ pub use hardware_board_info::HardwareBoardInfoTool;
 pub use hardware_memory_map::HardwareMemoryMapTool;
 #[cfg(feature = "hardware")]
 pub use hardware_memory_read::HardwareMemoryReadTool;
+#[cfg(feature = "channel-lark")]
+pub use feishu_doc::FeishuDocTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use mcp_client::McpRegistry;
@@ -535,15 +538,31 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Load WASM plugin tools from the skills directory.
-    // Each installed skill package may ship one or more WASM tools under
-    // `<skill-dir>/tools/<tool-name>/{tool.wasm, manifest.json}`.
-    // Failures are logged and skipped — a broken plugin must not block startup.
-    let skills_dir = workspace_dir.join("skills");
-    let mut boxed = boxed_registry_from_arcs(tool_arcs);
-    let wasm_tools = wasm_tool::load_wasm_tools_from_skills(&skills_dir);
-    boxed.extend(wasm_tools);
-    boxed
+    // Feishu document tools (enabled when channel-lark feature is active)
+    #[cfg(feature = "channel-lark")]
+    {
+        let feishu_creds = root_config
+            .channels_config
+            .feishu
+            .as_ref()
+            .map(|fs| (fs.app_id.clone(), fs.app_secret.clone(), true))
+            .or_else(|| {
+                root_config.channels_config.lark.as_ref().map(|lk| {
+                    (lk.app_id.clone(), lk.app_secret.clone(), lk.use_feishu)
+                })
+            });
+
+        if let Some((app_id, app_secret, use_feishu)) = feishu_creds {
+            tool_arcs.push(Arc::new(FeishuDocTool::new(
+                app_id,
+                app_secret,
+                use_feishu,
+                security.clone(),
+            )));
+        }
+    }
+
+    boxed_registry_from_arcs(tool_arcs)
 }
 
 #[cfg(test)]
