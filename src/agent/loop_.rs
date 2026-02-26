@@ -206,35 +206,7 @@ tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
 }
 
-const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
-    "telegram",
-    "discord",
-    "slack",
-    "mattermost",
-    "lark",
-    "feishu",
-];
-
-const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
-const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
-
-#[derive(Debug, Clone)]
-pub(crate) struct NonCliApprovalPrompt {
-    pub request_id: String,
-    pub tool_name: String,
-    pub arguments: serde_json::Value,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct NonCliApprovalContext {
-    pub sender: String,
-    pub reply_target: String,
-    pub prompt_tx: tokio::sync::mpsc::UnboundedSender<NonCliApprovalPrompt>,
-}
-
-tokio::task_local! {
-    static TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT: Option<NonCliApprovalContext>;
-}
+const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &["telegram", "discord", "slack", "mattermost"];
 
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
@@ -276,6 +248,7 @@ fn maybe_inject_cron_add_delivery(
 
     let is_agent_job = match args_obj.get("job_type").and_then(serde_json::Value::as_str) {
         Some("agent") => true,
+        Some("shell") => false,
         Some(_) => false,
         None => args_obj.contains_key("prompt"),
     };
@@ -324,41 +297,6 @@ fn maybe_inject_cron_add_delivery(
             "to".to_string(),
             serde_json::Value::String(reply_target.to_string()),
         );
-    }
-}
-
-async fn await_non_cli_approval_decision(
-    mgr: &ApprovalManager,
-    request_id: &str,
-    sender: &str,
-    channel_name: &str,
-    reply_target: &str,
-    cancellation_token: Option<&CancellationToken>,
-) -> ApprovalResponse {
-    let started = Instant::now();
-
-    loop {
-        if let Some(decision) = mgr.take_non_cli_pending_resolution(request_id) {
-            return decision;
-        }
-
-        if !mgr.has_non_cli_pending_request(request_id) {
-            // Fail closed when the request disappears without an explicit resolution.
-            return ApprovalResponse::No;
-        }
-
-        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
-            return ApprovalResponse::No;
-        }
-
-        if started.elapsed() >= Duration::from_secs(NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS) {
-            let _ =
-                mgr.reject_non_cli_pending_request(request_id, sender, channel_name, reply_target);
-            let _ = mgr.take_non_cli_pending_resolution(request_id);
-            return ApprovalResponse::No;
-        }
-
-        tokio::time::sleep(Duration::from_millis(NON_CLI_APPROVAL_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -588,59 +526,6 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
         .await
 }
 
-/// Run the tool loop with optional non-CLI approval context scoped to this task.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
-    provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-    provider_name: &str,
-    model: &str,
-    temperature: f64,
-    silent: bool,
-    approval: Option<&ApprovalManager>,
-    channel_name: &str,
-    non_cli_approval_context: Option<NonCliApprovalContext>,
-    multimodal_config: &crate::config::MultimodalConfig,
-    max_tool_iterations: usize,
-    cancellation_token: Option<CancellationToken>,
-    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
-    hooks: Option<&crate::hooks::HookRunner>,
-    excluded_tools: &[String],
-) -> Result<String> {
-    let reply_target = non_cli_approval_context
-        .as_ref()
-        .map(|ctx| ctx.reply_target.clone());
-
-    TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
-        .scope(
-            non_cli_approval_context,
-            TOOL_LOOP_REPLY_TARGET.scope(
-                reply_target,
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    approval,
-                    channel_name,
-                    multimodal_config,
-                    max_tool_iterations,
-                    cancellation_token,
-                    on_delta,
-                    hooks,
-                    excluded_tools,
-                ),
-            ),
-        )
-        .await
-}
-
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
 // Core agentic iteration: send conversation to the LLM, parse any tool
 // calls from the response, execute them, append results to history, and
@@ -674,19 +559,7 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
 ) -> Result<String> {
-    let non_cli_approval_context = TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
-        .try_with(Clone::clone)
-        .ok()
-        .flatten();
-    let channel_reply_target = TOOL_LOOP_REPLY_TARGET
-        .try_with(Clone::clone)
-        .ok()
-        .flatten()
-        .or_else(|| {
-            non_cli_approval_context
-                .as_ref()
-                .map(|ctx| ctx.reply_target.clone())
-        });
+    let channel_reply_target = TOOL_LOOP_REPLY_TARGET.try_with(Clone::clone).ok().flatten();
 
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2270,25 +2143,6 @@ mod tests {
         maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
 
         assert!(args.get("delivery").is_none());
-    }
-
-    #[test]
-    fn maybe_inject_cron_add_delivery_supports_lark_and_feishu_channels() {
-        let mut lark_args = serde_json::json!({
-            "job_type": "agent",
-            "prompt": "daily summary"
-        });
-        maybe_inject_cron_add_delivery("cron_add", &mut lark_args, "lark", Some("oc_xxx"));
-        assert_eq!(lark_args["delivery"]["channel"], "lark");
-        assert_eq!(lark_args["delivery"]["to"], "oc_xxx");
-
-        let mut feishu_args = serde_json::json!({
-            "job_type": "agent",
-            "prompt": "daily summary"
-        });
-        maybe_inject_cron_add_delivery("cron_add", &mut feishu_args, "feishu", Some("oc_yyy"));
-        assert_eq!(feishu_args["delivery"]["channel"], "feishu");
-        assert_eq!(feishu_args["delivery"]["to"], "oc_yyy");
     }
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
