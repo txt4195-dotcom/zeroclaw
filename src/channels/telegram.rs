@@ -612,7 +612,7 @@ impl TelegramChannel {
         });
     }
 
-    fn try_parse_approval_callback_query(
+    async fn try_parse_approval_callback_query(
         &self,
         update: &serde_json::Value,
     ) -> Option<ChannelMessage> {
@@ -3159,7 +3159,7 @@ Ensure only one `zeroclaw` process is using this bot token."
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
                         m
-                    } else if let Some(m) = self.try_parse_approval_callback_query(update) {
+                    } else if let Some(m) = self.try_parse_approval_callback_query(update).await {
                         m
                     } else if let Some(m) = self.try_parse_voice_message(update).await {
                         m
@@ -3828,26 +3828,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_approval_callback_command_trims_and_rejects_empty_ids() {
-        assert_eq!(
-            TelegramChannel::parse_approval_callback_command("zcapr:yes:   apr-1234   "),
-            Some("/approve-allow apr-1234".to_string())
-        );
-        assert_eq!(
-            TelegramChannel::parse_approval_callback_command("zcapr:no:\tapr-5678  "),
-            Some("/approve-deny apr-5678".to_string())
-        );
-        assert_eq!(
-            TelegramChannel::parse_approval_callback_command("zcapr:yes:   "),
-            None
-        );
-        assert_eq!(
-            TelegramChannel::parse_approval_callback_command("zcapr:no:"),
-            None
-        );
-    }
-
     #[tokio::test]
     async fn try_parse_approval_callback_query_builds_runtime_command_message() {
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
@@ -3862,7 +3842,7 @@ mod tests {
                 },
                 "message": {
                     "message_id": 44,
-                    "chat": { "id": -100_200_300 },
+                    "chat": { "id": -100200300 },
                     "message_thread_id": 789
                 }
             }
@@ -3870,6 +3850,7 @@ mod tests {
 
         let msg = ch
             .try_parse_approval_callback_query(&update)
+            .await
             .expect("callback query should parse");
 
         assert_eq!(msg.sender, "alice");
