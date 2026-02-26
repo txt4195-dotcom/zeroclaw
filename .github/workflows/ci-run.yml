@@ -318,7 +318,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, flake-probe, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
+        needs: [changes, lint, test, build, flake-probe, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, human-review-approval, license-file-owner-guard]
         runs-on: [self-hosted, aws-india]
         steps:
             - name: Enforce required status
