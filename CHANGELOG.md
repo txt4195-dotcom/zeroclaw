@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value if the input used the legacy `enc:` format
 - `SecretStore::needs_migration()` — Check if a value uses the legacy `enc:` format
 - `SecretStore::is_secure_encrypted()` — Check if a value uses the secure `enc2:` format
+- `feishu_doc` tool — Feishu/Lark document operations (read/write/append/create/table/media upload)
 - **Telegram mention_only mode** — New config option `mention_only` for Telegram channel.
   When enabled, bot only responds to messages that @-mention the bot in group chats.
   Direct messages always work regardless of this setting. Default: `false`.

@@ -12,7 +12,13 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{Context, Helper};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
@@ -1683,6 +1689,13 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
+    #[cfg(feature = "channel-lark")]
+    if config.channels_config.feishu.is_some() || config.channels_config.lark.is_some() {
+        tool_descs.push((
+            "feishu_doc",
+            "Manage Feishu/Lark documents: read, write, append, create, and table operations with media upload support.",
+        ));
+    }
     tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
@@ -2098,6 +2111,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     }
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+    }
+    #[cfg(feature = "channel-lark")]
+    if config.channels_config.feishu.is_some() || config.channels_config.lark.is_some() {
+        tool_descs.push((
+            "feishu_doc",
+            "Manage Feishu/Lark documents with read/write/table operations.",
+        ));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
         tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));

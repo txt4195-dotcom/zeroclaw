@@ -848,8 +848,23 @@ async fn e2e_live_research_phase() {
             );
         }
         Err(e) => {
-            // Network/API errors are expected if credentials aren't configured
-            println!("Research phase error (may be expected): {}", e);
+            let lower = e.to_string().to_ascii_lowercase();
+            let is_auth_or_env = [
+                "no auth profile",
+                "requires live provider api key",
+                "missing api key",
+                "credential",
+                "unauthorized",
+                "environment variable",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker));
+
+            if is_auth_or_env {
+                eprintln!("Skipping live research assertion due to auth/env setup: {e}");
+                return;
+            }
+            panic!("Research phase failed unexpectedly: {e}");
         }
     }
 
@@ -872,7 +887,8 @@ async fn e2e_agent_research_phase_integration() {
 
     // Create a recording provider to capture what the agent sends
     let (provider, recorded) = RecordingProvider::new(vec![
-        text_response("I'll research that for you"),
+        text_response("hello response"),
+        text_response("[RESEARCH COMPLETE]\n- found lint details"),
         text_response("Based on my research, here's the answer"),
     ]);
 
@@ -911,6 +927,27 @@ async fn e2e_agent_research_phase_integration() {
         assert!(
             !user_msg.content.contains("[Research"),
             "Message without keywords should not have research context"
+        );
+    }
+
+    // This message SHOULD trigger research (contains keyword + sufficient length)
+    let response2 = agent.turn("please search for lint errors").await.unwrap();
+    assert!(!response2.is_empty());
+
+    // Verify at least one request now carries prepended research context.
+    {
+        let requests = recorded.lock().unwrap();
+        assert!(
+            requests.len() >= 3,
+            "Expected additional provider requests after keyword-triggered turn"
+        );
+        let saw_research_phase_request = requests.iter().any(|req| {
+            req.iter()
+                .any(|m| m.role == "user" && m.content.contains("Research the following question"))
+        });
+        assert!(
+            saw_research_phase_request,
+            "Keyword-triggered turn should execute a research-phase provider request"
         );
     }
 }
@@ -953,10 +990,17 @@ async fn e2e_agent_research_always_trigger() {
 
     // With Always trigger, research should have been attempted
     let requests = recorded.lock().unwrap();
-    // At minimum 1 request (main turn), possibly 2 if research phase ran
     assert!(
-        !requests.is_empty(),
-        "Provider should have received at least one request"
+        requests.len() >= 2,
+        "Always trigger should issue research + main provider requests"
+    );
+    let saw_research_phase_request = requests.iter().any(|req| {
+        req.iter()
+            .any(|m| m.role == "user" && m.content.contains("Research the following question"))
+    });
+    assert!(
+        saw_research_phase_request,
+        "Always trigger should execute a research-phase provider request"
     );
 }
 
