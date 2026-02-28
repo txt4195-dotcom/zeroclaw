@@ -25,14 +25,11 @@ permissions:
     issues: write
 
 env:
-    GIT_CONFIG_COUNT: "1"
-    GIT_CONFIG_KEY_0: core.hooksPath
-    GIT_CONFIG_VALUE_0: /dev/null
     LABEL_POLICY_PATH: .github/label-policy.json
 
 jobs:
     label:
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64]
         steps:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

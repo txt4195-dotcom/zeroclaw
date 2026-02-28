@@ -16,7 +16,3 @@ Source anglaise:
 
 - Les noms de commandes, flags et clés de config restent en anglais.
 - La définition finale du comportement est la source anglaise.
-
-## Mise à jour récente
-
-- `zeroclaw gateway` prend en charge `--new-pairing` pour effacer les tokens appairés et générer un nouveau code d'appairage.

@@ -19,15 +19,9 @@ concurrency:
 permissions:
     contents: read
 
-env:
-    GIT_CONFIG_COUNT: "1"
-    GIT_CONFIG_KEY_0: core.hooksPath
-    GIT_CONFIG_VALUE_0: /dev/null
-
-
 jobs:
     contributor-tier-consistency:
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64]
         timeout-minutes: 10
         steps:
             - name: Checkout

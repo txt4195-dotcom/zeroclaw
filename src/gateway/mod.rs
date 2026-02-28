@@ -62,6 +62,10 @@ fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
 }
 
+fn api_chat_memory_key() -> String {
+    format!("api_chat_msg_{}", Uuid::new_v4())
+}
+
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
 }
@@ -1000,6 +1004,11 @@ pub struct WebhookBody {
     pub stream: Option<bool>,
 }
 
+#[derive(serde::Deserialize)]
+pub struct ApiChatBody {
+    pub message: String,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct NodeControlRequest {
     pub method: String,
@@ -1180,6 +1189,128 @@ async fn handle_node_control(
                 "supported_methods": ["node.list", "node.describe", "node.invoke"]
             })),
         ),
+    }
+}
+
+fn enforce_gateway_auth(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+    endpoint: &str,
+) -> std::result::Result<(), (StatusCode, serde_json::Value)> {
+    // Require at least one auth layer for non-loopback traffic.
+    if !state.pairing.require_pairing()
+        && state.webhook_secret_hash.is_none()
+        && !peer_addr.ip().is_loopback()
+    {
+        tracing::warn!(
+            "{endpoint}: rejected unauthenticated non-loopback request (pairing disabled and no webhook secret configured)"
+        );
+        let err = serde_json::json!({
+            "error": "Unauthorized — configure pairing or X-Webhook-Secret for non-local webhook access"
+        });
+        return Err((StatusCode::UNAUTHORIZED, err));
+    }
+
+    // Bearer token auth (pairing)
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("{endpoint}: rejected — not paired / invalid bearer token");
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return Err((StatusCode::UNAUTHORIZED, err));
+        }
+    }
+
+    // Optional shared secret auth for webhook-style clients.
+    if let Some(ref secret_hash) = state.webhook_secret_hash {
+        let header_hash = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(hash_webhook_secret);
+        match header_hash {
+            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            _ => {
+                tracing::warn!(
+                    "{endpoint}: rejected request — invalid or missing X-Webhook-Secret"
+                );
+                let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
+                return Err((StatusCode::UNAUTHORIZED, err));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// POST /api/chat — tools-enabled chat endpoint for remote integrations.
+///
+/// Request:
+/// `{ "message": "..." }`
+///
+/// Response:
+/// `{ "reply": "..." }`
+async fn handle_api_chat(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<ApiChatBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/api/chat rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many chat requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    if let Err((status, err)) = enforce_gateway_auth(&state, peer_addr, &headers, "/api/chat") {
+        return (status, Json(err));
+    }
+
+    let Json(chat_body) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("/api/chat JSON parse error: {e}");
+            let err = serde_json::json!({
+                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    if state.auto_save {
+        let key = api_chat_memory_key();
+        let _ = state
+            .mem
+            .store(&key, &chat_body.message, MemoryCategory::Conversation, None)
+            .await;
+    }
+
+    match run_gateway_chat_with_tools(&state, &chat_body.message).await {
+        Ok(response) => {
+            let safe_response =
+                sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+            let body = serde_json::json!({ "reply": safe_response });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+            tracing::error!("/api/chat provider error: {}", sanitized);
+            let err = serde_json::json!({"error": "LLM request failed"});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
     }
 }
 
@@ -3011,6 +3142,114 @@ Reminder set successfully."#;
         assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["idempotent"], true);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn api_chat_rejects_invalid_bearer_when_pairing_required() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(true, &["valid-token".into()])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer invalid-token"),
+        );
+
+        let response = handle_api_chat(
+            State(state),
+            test_connect_info(),
+            headers,
+            Ok(Json(ApiChatBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn api_chat_rejects_public_traffic_without_auth_layers() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_api_chat(
+            State(state),
+            test_public_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(ApiChatBody {
+                message: "hello from api chat".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

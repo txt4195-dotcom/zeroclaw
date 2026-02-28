@@ -17,7 +17,6 @@ pub struct HttpRequestTool {
     url_access: UrlAccessConfig,
     max_response_size: usize,
     timeout_secs: u64,
-    user_agent: String,
 }
 
 impl HttpRequestTool {
@@ -27,7 +26,6 @@ impl HttpRequestTool {
         url_access: UrlAccessConfig,
         max_response_size: usize,
         timeout_secs: u64,
-        user_agent: String,
     ) -> Self {
         Self {
             security,
@@ -35,7 +33,6 @@ impl HttpRequestTool {
             url_access,
             max_response_size,
             timeout_secs,
-            user_agent,
         }
     }
 
@@ -115,8 +112,7 @@ impl HttpRequestTool {
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(self.user_agent.as_str());
+            .redirect(reqwest::redirect::Policy::none());
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let client = builder.build()?;
 
@@ -134,6 +130,10 @@ impl HttpRequestTool {
     }
 
     fn truncate_response(&self, text: &str) -> String {
+        // 0 means unlimited — no truncation.
+        if self.max_response_size == 0 {
+            return text.to_string();
+        }
         if text.len() > self.max_response_size {
             let mut truncated = text
                 .chars()
@@ -290,11 +290,157 @@ impl Tool for HttpRequestTool {
     }
 }
 
+// Helper functions similar to browser_open.rs
+
+fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+    let mut normalized = domains
+        .into_iter()
+        .filter_map(|d| normalize_domain(&d))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
+}
+
+fn normalize_domain(raw: &str) -> Option<String> {
+    let mut d = raw.trim().to_lowercase();
+    if d.is_empty() {
+        return None;
+    }
+
+    if let Some(stripped) = d.strip_prefix("https://") {
+        d = stripped.to_string();
+    } else if let Some(stripped) = d.strip_prefix("http://") {
+        d = stripped.to_string();
+    }
+
+    if let Some((host, _)) = d.split_once('/') {
+        d = host.to_string();
+    }
+
+    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
+
+    if let Some((host, _)) = d.split_once(':') {
+        d = host.to_string();
+    }
+
+    if d.is_empty() || d.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    Some(d)
+}
+
+fn extract_host(url: &str) -> anyhow::Result<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
+
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
+
+    if authority.is_empty() {
+        anyhow::bail!("URL must include a host");
+    }
+
+    if authority.contains('@') {
+        anyhow::bail!("URL userinfo is not allowed");
+    }
+
+    if authority.starts_with('[') {
+        anyhow::bail!("IPv6 hosts are not supported in http_request");
+    }
+
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('.')
+        .to_lowercase();
+
+    if host.is_empty() {
+        anyhow::bail!("URL must include a valid host");
+    }
+
+    Ok(host)
+}
+
+fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+    if allowed_domains.iter().any(|domain| domain == "*") {
+        return true;
+    }
+
+    allowed_domains.iter().any(|domain| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn is_private_or_local_host(host: &str) -> bool {
+    // Strip brackets from IPv6 addresses like [::1]
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let has_local_tld = bare
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label == "local");
+
+    if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
+        return true;
+    }
+
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
+        };
+    }
+
+    false
+}
+
+/// Returns true if the IPv4 address is not globally routable.
+fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    v4.is_loopback()                       // 127.0.0.0/8
+        || v4.is_private()                 // 10/8, 172.16/12, 192.168/16
+        || v4.is_link_local()              // 169.254.0.0/16
+        || v4.is_unspecified()             // 0.0.0.0
+        || v4.is_broadcast()              // 255.255.255.255
+        || v4.is_multicast()              // 224.0.0.0/4
+        || (a == 100 && (64..=127).contains(&b)) // Shared address space (RFC 6598)
+        || a >= 240                        // Reserved (240.0.0.0/4, except broadcast)
+        || (a == 192 && b == 0 && (c == 0 || c == 2)) // IETF assignments + TEST-NET-1
+        || (a == 198 && b == 51)           // Documentation (198.51.100.0/24)
+        || (a == 203 && b == 0)            // Documentation (203.0.113.0/24)
+        || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
+}
+
+/// Returns true if the IPv6 address is not globally routable.
+fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
+    let segs = v6.segments();
+    v6.is_loopback()                       // ::1
+        || v6.is_unspecified()             // ::
+        || v6.is_multicast()              // ff00::/8
+        || (segs[0] & 0xfe00) == 0xfc00   // Unique-local (fc00::/7)
+        || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
+        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
+        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use crate::tools::url_validation::{is_private_or_local_host, normalize_domain};
 
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
         let security = Arc::new(SecurityPolicy {
@@ -307,7 +453,6 @@ mod tests {
             UrlAccessConfig::default(),
             1_000_000,
             30,
-            "test".to_string(),
         )
     }
 
@@ -360,14 +505,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
-    }
-
-    #[test]
-    fn validate_accepts_wildcard_subdomain_pattern() {
-        let tool = test_tool(vec!["*.example.com"]);
-        assert!(tool.validate_url("https://example.com").is_ok());
-        assert!(tool.validate_url("https://sub.example.com").is_ok());
-        assert!(tool.validate_url("https://other.com").is_err());
     }
 
     #[test]
@@ -599,11 +736,36 @@ mod tests {
             UrlAccessConfig::default(),
             10,
             30,
-            "test".to_string(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
         assert!(truncated.len() <= 10 + 60); // limit + message
+        assert!(truncated.contains("[Response truncated"));
+    }
+
+    #[test]
+    fn truncate_response_zero_means_unlimited() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            0, // max_response_size = 0 means no limit
+            30,
+        );
+        let text = "a".repeat(10_000_000);
+        assert_eq!(tool.truncate_response(&text), text);
+    }
+
+    #[test]
+    fn truncate_response_nonzero_still_truncates() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            5,
+            30,
+        );
+        let text = "hello world";
+        let truncated = tool.truncate_response(text);
+        assert!(truncated.starts_with("hello"));
         assert!(truncated.contains("[Response truncated"));
     }
 

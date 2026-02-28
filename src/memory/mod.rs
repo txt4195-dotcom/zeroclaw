@@ -293,7 +293,6 @@ pub fn create_memory_with_storage_and_routes(
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
-            storage_provider.tls,
         )?;
         Ok(Box::new(memory))
     }

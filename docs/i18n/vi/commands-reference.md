@@ -46,10 +46,8 @@ Xác minh lần cuối: **2026-02-20**.
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>] [--new-pairing]`
+- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
 - `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
-
-`--new-pairing` sẽ xóa toàn bộ token đã ghép đôi và tạo mã ghép đôi mới khi gateway khởi động.
 
 ### `service`
 

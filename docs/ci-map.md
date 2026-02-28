@@ -45,7 +45,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: legacy/dev-only nightly template; primary nightly signal is emitted by `feature-matrix.yml` nightly profile
     - Additional behavior: owner routing + escalation policy is documented in `docs/operations/nightly-all-features-runbook.md`
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
-    - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA), policy/license checks (`cargo deny`), gitleaks-based secrets governance (allowlist policy metadata + expiry guard), and SBOM snapshot artifacts (`CycloneDX` + `SPDX`)
+    - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA) and policy/license checks (`cargo deny`)
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
     - Purpose: static analysis for security findings on PR/push (Rust/codeql paths) plus scheduled/manual runs
 - `.github/workflows/ci-change-audit.yml` (`CI/CD Change Audit`)
@@ -63,6 +63,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
+- `.github/workflows/pub-homebrew-core.yml` (`Pub Homebrew Core`)
+    - Purpose: manual, bot-owned Homebrew core formula bump PR flow for tagged releases
+    - Guardrail: release tag must match `Cargo.toml` version
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
     - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
 - `.github/workflows/test-rust-build.yml` (`Rust Reusable Job`)
@@ -97,11 +100,12 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 ## Trigger Map
 
-- `CI`: push to `dev` and `main`, PRs to `dev` and `main`, merge queue `merge_group` for `dev`/`main`
+- `CI`: push to `dev` and `main`, PRs to `dev` and `main`
 - `Docker`: tag push (`v*`) for publish, matching PRs to `dev`/`main` for smoke build, manual dispatch for smoke only
 - `Feature Matrix`: push on Rust + workflow paths to `dev`, merge queue, weekly schedule, manual dispatch; PRs only when `ci:full` or `ci:feature-matrix` label is applied
 - `Nightly All-Features`: daily schedule and manual dispatch
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
+- `Pub Homebrew Core`: manual dispatch only
 - `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
@@ -119,44 +123,30 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 1. `CI Required Gate` failing: start with `.github/workflows/ci-run.yml`.
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
-   - For tag-publish failures, inspect `ghcr-publish-contract.json` / `audit-event-ghcr-publish-contract.json`, `ghcr-vulnerability-gate.json` / `audit-event-ghcr-vulnerability-gate.json`, and Trivy artifacts from `pub-docker-img.yml`.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
-4. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
-5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-6. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
-7. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
-8. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-9. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+4. Homebrew formula publish failures: inspect `.github/workflows/pub-homebrew-core.yml` summary output and bot token/fork variables.
+5. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
+6. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
+7. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
+8. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
+9. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
+10. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
-- Keep merge-queue compatibility explicit by supporting `merge_group` on required workflows (`ci-run`, `sec-audit`, and `sec-codeql`).
-- Keep PRs mapped to Linear issue keys (`RMN-*`/`CDV-*`/`COM-*`) via PR intake checks.
-- Keep `deny.toml` advisory ignore entries in object form with explicit reasons (enforced by `deny_policy_guard.py`).
-- Keep deny ignore governance metadata current in `.github/security/deny-ignore-governance.json` (owner/reason/expiry/ticket enforced by `deny_policy_guard.py`).
-- Keep gitleaks allowlist governance metadata current in `.github/security/gitleaks-allowlist-governance.json` (owner/reason/expiry/ticket enforced by `secrets_governance_guard.py`).
-- Keep audit event schema + retention metadata aligned with `docs/audit-event-schema.md` (`emit_audit_event.py` envelope + workflow artifact policy).
-- Keep rollback operations guarded and reversible (`ci-rollback.yml` defaults to `dry-run`; `execute` is manual and policy-gated).
-- Keep canary policy thresholds and sample-size rules current in `.github/release/canary-policy.json`.
-- Keep GHCR tag taxonomy and immutability policy current in `.github/release/ghcr-tag-policy.json` and `docs/operations/ghcr-tag-policy.md`.
-- Keep GHCR vulnerability gate policy current in `.github/release/ghcr-vulnerability-policy.json` and `docs/operations/ghcr-vulnerability-policy.md`.
-- Keep pre-release stage transition policy + matrix coverage + transition audit semantics current in `.github/release/prerelease-stage-gates.json`.
-- Keep required check naming stable and documented in `docs/operations/required-check-mapping.md` before changing branch protection settings.
 - Follow `docs/release-process.md` for verify-before-publish release cadence and tag discipline.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
 - Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
 - Run full strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
 - Keep docs markdown gating incremental via `./scripts/ci/docs_quality_gate.sh` (block changed-line issues, report baseline issues separately).
 - Keep docs link gating incremental via `./scripts/ci/collect_changed_links.py` + lychee (check only links added on changed lines).
-- Keep docs deploy policy current in `.github/release/docs-deploy-policy.json`, `docs/operations/docs-deploy-policy.md`, and `docs/operations/docs-deploy-runbook.md`.
 - Prefer explicit workflow permissions (least privilege).
 - Keep Actions source policy restricted to approved allowlist patterns (see `docs/actions-source-policy.md`).
 - Use path filters for expensive workflows when practical.
 - Keep docs quality checks low-noise (incremental markdown + incremental added-link checks).
 - Use `scripts/ci/queue_hygiene.py` for controlled cleanup of obsolete or superseded queued runs during runner-pressure incidents.
 - Keep dependency update volume controlled (grouping + PR limits).
-- Install third-party CI tooling through repository-managed pinned installers with checksum verification (for example `scripts/ci/install_gitleaks.sh`, `scripts/ci/install_syft.sh`); avoid remote `curl | sh` patterns.
 - Avoid mixing onboarding/community automation with merge-gating logic.
 
 ## Automation Side-Effect Controls
