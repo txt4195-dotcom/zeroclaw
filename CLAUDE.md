@@ -538,84 +538,256 @@ When working in fast iterative mode:
 
 ## 13) Fork: Spore Deployment (txt4195-dotcom/zeroclaw)
 
-This section is specific to the `txt4195-dotcom/zeroclaw` fork. Upstream: `zeroclaw-labs/zeroclaw`.
+Fork-specific. Upstream: `zeroclaw-labs/zeroclaw`.
 
-### 13.1 Purpose
+### 13.1 Deploy Flow
 
-Deploy ZeroClaw as the "Spore" runtime — a Railway-hosted container with browser automation (OpenChrome), remote GUI access (noVNC), and Telegram control channel.
+```
+push to main → GHA builds → GHCR push → serviceInstanceUpdate(@digest) → serviceInstanceDeployV2 → Railway fresh pull
+```
 
-### 13.2 Spore-Specific Files
+- Image: `ghcr.io/txt4195-dotcom/zeroclaw:spore`
+- Railway service: `zeroclaw-spore-v2` (GHCR image source)
+- Volume: `/zeroclaw-data` (config, workspace, Chrome profile, SQLite)
+- Railway IDs: serviceId=`496f96fe-9871-490a-87c1-33e75a136262`, environmentId=`71a5fa95-c9a5-4c32-8861-6105c472d8b6`
+
+#### 자동 배포 (CI)
+
+main에 push하면 GHA가 자동으로 빌드 → GHCR push → Railway deploy까지 처리.
+`build-spore.yml`의 "Deploy to Railway" step이 digest 기반으로 `serviceInstanceUpdate` + `serviceInstanceDeployV2` 호출.
+
+```bash
+# 빌드 상태 확인
+gh run list -R txt4195-dotcom/zeroclaw --workflow build-spore.yml --limit 3
+```
+
+#### 수동 배포 (Railway API)
+
+Railway는 mutable tag (`:spore`)를 re-resolve하지 않음. **반드시 digest를 지정**해야 새 이미지를 pull.
+
+```bash
+# 1. serviceInstanceUpdate로 image source를 digest로 변경
+curl -sf -X POST https://backboard.railway.com/graphql/v2 \
+  -H "Authorization: Bearer $RAILWAY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "mutation { serviceInstanceUpdate(serviceId: \"<SVC_ID>\", environmentId: \"<ENV_ID>\", input: { source: { image: \"ghcr.io/txt4195-dotcom/zeroclaw@sha256:<DIGEST>\" } }) }"}'
+
+# 2. serviceInstanceDeployV2로 새 deployment 생성
+curl -sf -X POST https://backboard.railway.com/graphql/v2 \
+  -H "Authorization: Bearer $RAILWAY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "mutation { serviceInstanceDeployV2(serviceId: \"<SVC_ID>\", environmentId: \"<ENV_ID>\") }"}'
+```
+
+주의: `railway redeploy` (CLI/대시보드)는 기존 deployment를 재사용하며 이미지를 다시 pull하지 않음.
+
+#### 컨테이너 접속
+
+```bash
+railway ssh              # SSH 접속
+railway ssh -- <command> # 단일 명령 실행
+```
+
+#### VS Code Remote Tunnel
+
+`start-spore.sh`에서 자동 시작. 최초 실행 시 GitHub device flow 인증 필요 (로그 확인).
+
+```bash
+# 브라우저: https://vscode.dev/tunnel/zeroclaw-spore
+# 로컬 VS Code: Remote Tunnels 확장 → zeroclaw-spore 선택
+```
+
+### 13.2 Spore Files
 
 | File | Role |
 |------|------|
-| `start-spore.sh` | Container entrypoint: dirs → Xvfb → x11vnc → noVNC → nginx → `zeroclaw daemon` |
-| `nginx-spore.conf` | Port routing: `/` → gateway (:42617), `/vnc/` → noVNC (:6080) |
-| `railway.toml` | Railway deployment config with volume mount at `/zeroclaw-data` |
-| `Dockerfile` (stage `spore`) | `FROM dev AS spore` — adds Chromium, Xvfb, VNC, nginx, Node.js |
-| `.github/workflows/build-spore.yml` | CI: build `--target spore` → push to GHCR |
+| `start-spore.sh` | Entrypoint: Xvfb → VNC → noVNC → nginx → VS Code tunnel → `zeroclaw daemon` |
+| `nginx-spore.conf` | :8080 → gateway (:42617) + noVNC (:6080) |
+| `railway.toml` | Volume mount config |
+| `Dockerfile` (stage `spore`) | FROM dev + Chromium + Xvfb + VNC + nginx |
+| `.github/workflows/build-spore.yml` | Build & push to GHCR |
 
-### 13.3 Docker Multi-Stage Build
+### 13.3 Config & Secrets
 
-```
-builder  → Rust release binary (cargo build --release --locked)
-dev      → Debian trixie-slim + binary + dev config
-release  → Distroless + binary + production config
-spore    → FROM dev + Chromium + Xvfb + noVNC + nginx
-```
-
-Build the spore image: `docker build --target spore -t zeroclaw:spore .`
-
-### 13.4 Upstream Sync
-
-```bash
-git fetch upstream main
-git rebase upstream/main
-git push origin main --force-with-lease
-```
-
-After syncing, always verify with `cargo check` before pushing.
-
-### 13.5 Config & Secret Management
-
-**No config files baked into the image.** All configuration is done via CLI after deployment:
+No config in image. All via CLI:
 
 ```bash
 railway shell
-zeroclaw onboard          # Interactive setup: API key, provider, Telegram, etc.
+zeroclaw onboard    # API key, provider, Telegram, etc.
 ```
 
-Config persists in the volume at `/zeroclaw-data/.zeroclaw/`.
+Persists in volume. Env var overrides: `ZEROCLAW_API_KEY`, `ZEROCLAW_PROVIDER`, `ZEROCLAW_MODEL`.
 
-**Environment variable overrides (native):**
-- `ZEROCLAW_API_KEY` → api_key
-- `ZEROCLAW_PROVIDER` → default_provider
-- `ZEROCLAW_MODEL` → default_model
+### 13.4 VNC (Chrome Login)
 
-**Railway env vars set:**
-- `RAILWAY_DOCKERFILE_TARGET=spore`
-- `ZEROCLAW_API_KEY=<key>`
+`https://<railway-url>/vnc/` — Chrome GUI for Google login. Session in `/zeroclaw-data/chrome-storage/`.
 
-### 13.6 Railway Volume
+### 13.5 Upstream Sync
 
-Single mount: `/zeroclaw-data` (source: `zeroclaw-spore-volume`)
+```bash
+git fetch upstream main && git rebase upstream/main && git push origin main --force-with-lease
+```
 
-Contains:
-- `.zeroclaw/config.toml` — runtime config (set via `zeroclaw onboard`)
-- `.zeroclaw/.secret_key` — AES encryption key for SecretStore
-- `workspace/` — agent workspace files
-- `chrome-storage/` — Chrome profile (cookies, sessions, local storage)
-- SQLite databases (ZeroClaw memory)
+Always `cargo check` after sync.
 
-### 13.7 VNC Access (Chrome Login)
+### 13.6 Post-Deploy
 
-`https://<railway-url>/vnc/` → noVNC → Chromium GUI
+1. `railway shell` → `zeroclaw onboard`
+2. `/vnc/` → Chrome Google 로그인
+3. Telegram bot 테스트
+4. Restart → 볼륨 persist 확인
 
-Purpose: log into Google/other services in Chrome. Session persists in `/zeroclaw-data/chrome-storage/`.
+---
 
-### 13.8 Post-Deploy Checklist
+## 14) Quick Lookup Index
 
-1. `railway shell` → `zeroclaw onboard` (API key, provider, Telegram token)
-2. `https://<url>/vnc/` → Chrome에서 Google 로그인
-3. Telegram → message bot
-4. Verify: `https://<url>/` → ZeroClaw gateway 응답
-5. Restart → volume persist 확인 (설정 유지되는지)
+질문 → 어디를 봐야 하는지.
+
+### 설정/Config
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 설정 키 전체 목록 | `docs/config-reference.md` |
+| 설정 스키마 (코드) | `src/config/schema.rs` |
+| 환경변수 오버라이드 | `docs/config-reference.md` (각 섹션별 env override 항목) |
+| 설정 검증 | `zeroclaw status`, `zeroclaw doctor` |
+
+### CLI 명령어
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 명령어 전체 목록 | `docs/commands-reference.md` |
+| 명령어 구현/라우팅 | `src/main.rs` |
+
+### Provider (LLM)
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 지원 provider 목록 | `docs/providers-reference.md` |
+| 커스텀 provider 설정 | `docs/custom-providers.md` |
+| provider trait/구현 | `src/providers/traits.rs`, `src/providers/` |
+| 모델 라우팅 (hint) | `docs/config-reference.md` → `[[model_routes]]`, `[query_classification]` |
+
+### 채널 (Telegram/Discord 등)
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 채널 설정 매트릭스 | `docs/channels-reference.md` |
+| 채널 config 키 | `docs/config-reference.md` → `[channels_config.*]` |
+| 채널 코드/시스템 프롬프트 빌드 | `src/channels/mod.rs` |
+| 그룹챗 정책 | `docs/channels-reference.md` (group_reply, mention_only) |
+| allowlist/승인 관리 | `docs/config-reference.md` → `[autonomy]` (non_cli_*, /approve) |
+
+### 도구 (Tools)
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 기본 제공 도구 목록 | `src/tools/` (각 파일이 도구 하나) |
+| 도구 차단/허용 (비CLI) | `docs/config-reference.md` → `[autonomy].non_cli_excluded_tools` |
+| WASM 커스텀 도구 | `docs/wasm-tools-guide.md` |
+| 외부 API 호출 (credential) | `docs/config-reference.md` → `[http_request.credential_profiles]` |
+| 도구 trait | `src/tools/traits.rs` |
+
+### 에이전트/위임
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| delegate 서브에이전트 | `docs/config-reference.md` → `[agents.<name>]` |
+| delegate 코드 | `src/tools/delegate.rs` |
+| 에이전트 간 IPC | `docs/config-reference.md` → `[agents_ipc]` |
+| IPC 코드 (SQLite) | `src/tools/agents_ipc.rs` |
+
+### 메모리
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 메모리 backend 설정 | `docs/config-reference.md` → `[memory]` |
+| 메모리 trait/구현 | `src/memory/traits.rs`, `src/memory/` |
+| 임베딩 라우팅 | `docs/config-reference.md` → `[[embedding_routes]]` |
+| 정체성 파일 (IDENTITY.md 등) | workspace 루트 `.md` 파일들, `src/channels/mod.rs` → `load_openclaw_bootstrap_files()` |
+
+### 보안
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| OTP/estop/URL정책 | `docs/config-reference.md` → `[security.*]` |
+| 보안 코드 | `src/security/` |
+| 보안 로드맵 (proposal) | `docs/security-roadmap.md` |
+| 샌드박싱 옵션 | `docs/sandboxing.md` |
+| 감사 로깅 | `docs/audit-logging.md`, `docs/audit-event-schema.md` |
+
+### 웹/브라우저
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 브라우저 자동화 | `docs/config-reference.md` → `[browser]` |
+| 웹 검색 설정 | `docs/config-reference.md` → `[web_search]` |
+| 웹 페이지 추출 | `docs/config-reference.md` → `[web_fetch]` |
+| HTTP 요청 도구 | `docs/config-reference.md` → `[http_request]` |
+
+### 배포/운영
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| Spore (Railway) 배포 | 이 문서 Section 13 |
+| Docker 셋업 | `docs/docker-setup.md` |
+| 운영 런북 | `docs/operations-runbook.md` |
+| 트러블슈팅 | `docs/troubleshooting.md` |
+| 네트워크 배포 (RPi) | `docs/network-deployment.md` |
+| CI 워크플로우 맵 | `docs/ci-map.md` |
+
+### 하드웨어
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 주변장치 설계 | `docs/hardware-peripherals-design.md` |
+| 보드 추가 방법 | `docs/adding-boards-and-tools.md` |
+| 데이터시트 (핀맵) | `docs/datasheets/` |
+| peripheral trait | `src/peripherals/traits.rs` |
+
+### 플러그인/확장
+
+| 질문 | 찾는 곳 |
+|------|---------|
+| 플러그인 시스템 | `docs/PLUGINS.md` |
+| 스킬 설정 | `docs/config-reference.md` → `[skills]` |
+| 크론 스케줄링 | `docs/cron-scheduling.md` |
+| Composio OAuth | `docs/config-reference.md` → `[composio]` |
+| Gateway REST API | `src/gateway/mod.rs`, `src/gateway/api.rs` |
+
+### 멀티봇 아키텍처 (코드 수정 없이 가능)
+
+한 컨테이너에서 `--config-dir`로 여러 인스턴스 실행:
+
+```
+zeroclaw daemon --config-dir /zeroclaw-data/bot-observer  # gateway :42617
+zeroclaw daemon --config-dir /zeroclaw-data/bot-personal  # gateway :42618
+```
+
+- 각 인스턴스: 별도 config.toml, 별도 Telegram bot token, 별도 gateway port
+- 공유: `agents_ipc.db_path` (같은 SQLite → 서로 발견/통신/상태 공유)
+
+| 기능 | 설정만으로 가능 | 어디서 |
+|------|:---:|---------|
+| 멀티봇 (관찰 + 1:1) | O | `--config-dir` |
+| 봇 간 통신/상태 공유 | O | `[agents_ipc]` → `state_get/set`, `agents_send/inbox` |
+| 메시지별 모델 자동 전환 | O | `[query_classification]` + `[[model_routes]]` |
+| 응답 전 자동 조사 | O | `[research]` |
+| 서브에이전트 위임 | O | `[agents.<name>]` + delegate |
+| 외부 API 호출 | O | `[http_request]` + `credential_profiles` |
+| 스케줄 작업 | O | cron |
+| 웹 검색/페이지 읽기 | O | `[web_search]` + `[web_fetch]` |
+| 브라우저 자동화 | O | `[browser]` |
+| 도구 실행 권한 관리 | O | `[autonomy]` |
+| 그룹 대화 통째로 기억 | △ | conversation history가 per-user. 관찰봇이 `memory_store`로 우회 가능 |
+
+### 인증 체계
+
+| 레이어 | 목적 | 방식 |
+|--------|------|------|
+| Gateway pairing | API 접근 권한 (대시보드/REST) | 1회 6자리 코드 → bearer token 교환 |
+| Security OTP | 위험 도구 실행 허가 | TOTP (Google Authenticator 등) |
+| Channel allowlist | 채널 사용자 허가 | `allowed_users` (deny-by-default) |
+
+원격 zeroclaw 간 통신: gateway HTTP + `credential_profiles`로 bearer token 주입.
+같은 머신: IPC (무료, 비동기) + gateway HTTP (LLM 비용 발생) 병용.

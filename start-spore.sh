@@ -31,6 +31,10 @@ echo "[spore] noVNC started on :6080"
 nginx -c /etc/nginx/nginx-spore.conf &
 echo "[spore] nginx started on :8080"
 
-# ── 7. Start ZeroClaw daemon (gateway + channels) ──
+# ── 7. Start VS Code tunnel (remote editing) ──
+code tunnel --accept-server-license-terms --name zeroclaw-spore &
+echo "[spore] VS Code tunnel starting (check logs for GitHub auth on first run)"
+
+# ── 8. Start ZeroClaw daemon (gateway + channels) ──
 echo "[spore] Starting zeroclaw daemon..."
 exec zeroclaw daemon
