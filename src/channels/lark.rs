@@ -1,5 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
@@ -216,6 +217,8 @@ const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(120);
 const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
+const LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT: &str =
+    "[Image message received but could not be downloaded]";
 
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
@@ -320,18 +323,24 @@ fn next_token_refresh_deadline(now: Instant, ttl_seconds: u64) -> Instant {
     now + refresh_in
 }
 
+fn sanitize_lark_body(body: &serde_json::Value) -> String {
+    crate::providers::sanitize_api_error(&body.to_string())
+}
+
 fn ensure_lark_send_success(
     status: reqwest::StatusCode,
     body: &serde_json::Value,
     context: &str,
 ) -> anyhow::Result<()> {
     if !status.is_success() {
-        anyhow::bail!("Lark send failed {context}: status={status}, body={body}");
+        let sanitized = sanitize_lark_body(body);
+        anyhow::bail!("Lark send failed {context}: status={status}, body={sanitized}");
     }
 
     let code = extract_lark_response_code(body).unwrap_or(0);
     if code != 0 {
-        anyhow::bail!("Lark send failed {context}: code={code}, body={body}");
+        let sanitized = sanitize_lark_body(body);
+        anyhow::bail!("Lark send failed {context}: code={code}, body={sanitized}");
     }
 
     Ok(())
@@ -349,12 +358,11 @@ pub struct LarkChannel {
     verification_token: String,
     port: Option<u16>,
     allowed_users: Vec<String>,
+    group_reply_allowed_sender_ids: Vec<String>,
     /// Bot open_id resolved at runtime via `/bot/v3/info`.
     resolved_bot_open_id: Arc<StdRwLock<Option<String>>>,
     mention_only: bool,
     platform: LarkPlatform,
-    /// When true, use Feishu (CN) endpoints; when false, use Lark (international).
-    use_feishu: bool,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
     /// Cached tenant access token
@@ -398,10 +406,10 @@ impl LarkChannel {
             verification_token,
             port,
             allowed_users,
+            group_reply_allowed_sender_ids: Vec::new(),
             resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
             mention_only,
             platform,
-            use_feishu: matches!(platform, LarkPlatform::Feishu),
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
@@ -425,6 +433,8 @@ impl LarkChannel {
             config.effective_group_reply_mode().requires_mention(),
             platform,
         );
+        ch.group_reply_allowed_sender_ids =
+            normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
         ch
     }
@@ -439,6 +449,8 @@ impl LarkChannel {
             config.effective_group_reply_mode().requires_mention(),
             LarkPlatform::Lark,
         );
+        ch.group_reply_allowed_sender_ids =
+            normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
         ch
     }
@@ -453,6 +465,8 @@ impl LarkChannel {
             config.effective_group_reply_mode().requires_mention(),
             LarkPlatform::Feishu,
         );
+        ch.group_reply_allowed_sender_ids =
+            normalize_group_reply_allowed_sender_ids(config.group_reply_allowed_sender_ids());
         ch.receive_mode = config.receive_mode.clone();
         ch
     }
@@ -489,6 +503,10 @@ impl LarkChannel {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
     }
 
+    fn image_download_url(&self, image_key: &str) -> String {
+        format!("{}/im/v1/images/{image_key}", self.api_base())
+    }
+
     fn resolved_bot_open_id(&self) -> Option<String> {
         self.resolved_bot_open_id
             .read()
@@ -499,6 +517,61 @@ impl LarkChannel {
     fn set_resolved_bot_open_id(&self, open_id: Option<String>) {
         if let Ok(mut guard) = self.resolved_bot_open_id.write() {
             *guard = open_id;
+        }
+    }
+
+    async fn fetch_image_marker(&self, image_key: &str) -> anyhow::Result<String> {
+        if image_key.trim().is_empty() {
+            anyhow::bail!("empty image_key");
+        }
+
+        let mut token = self.get_tenant_access_token().await?;
+        let mut retried = false;
+        let url = self.image_download_url(image_key);
+
+        loop {
+            let response = self
+                .http_client()
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?;
+
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = response.bytes().await?;
+
+            if status.is_success() {
+                if body.is_empty() {
+                    anyhow::bail!("image payload is empty");
+                }
+                let media_type = content_type
+                    .as_deref()
+                    .and_then(|value| value.split(';').next())
+                    .map(str::trim)
+                    .filter(|value| value.starts_with("image/"))
+                    .unwrap_or("image/png");
+                let encoded = base64::engine::general_purpose::STANDARD.encode(body);
+                return Ok(format!("[IMAGE:data:{media_type};base64,{encoded}]"));
+            }
+
+            let parsed = serde_json::from_slice::<serde_json::Value>(&body)
+                .unwrap_or(serde_json::Value::Null);
+            if !retried && should_refresh_lark_tenant_token(status, &parsed) {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            anyhow::bail!(
+                "Lark image download failed: status={status}, body={}",
+                crate::providers::sanitize_api_error(&String::from_utf8_lossy(&body))
+            );
         }
     }
 
@@ -573,8 +646,9 @@ impl LarkChannel {
             if !response.status().is_success() {
                 let status = response.status();
                 let err_body = response.text().await.unwrap_or_default();
+                let sanitized = crate::providers::sanitize_api_error(&err_body);
                 tracing::warn!(
-                    "Lark: add reaction failed for {message_id}: status={status}, body={err_body}"
+                    "Lark: add reaction failed for {message_id}: status={status}, body={sanitized}"
                 );
                 return;
             }
@@ -861,6 +935,8 @@ impl LarkChannel {
                     if lark_msg.chat_type == "group"
                         && !should_respond_in_group(
                             self.mention_only,
+                            sender_open_id,
+                            &self.group_reply_allowed_sender_ids,
                             bot_open_id.as_deref(),
                             &lark_msg.mentions,
                             &post_mentioned_open_ids,
@@ -928,7 +1004,10 @@ impl LarkChannel {
         let data: serde_json::Value = resp.json().await?;
 
         if !status.is_success() {
-            anyhow::bail!("Lark tenant_access_token request failed: status={status}, body={data}");
+            let sanitized = sanitize_lark_body(&data);
+            anyhow::bail!(
+                "Lark tenant_access_token request failed: status={status}, body={sanitized}"
+            );
         }
 
         let code = data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -994,21 +1073,24 @@ impl LarkChannel {
             let refreshed = self.get_tenant_access_token().await?;
             let (retry_status, retry_body) = self.fetch_bot_open_id_with_token(&refreshed).await?;
             if !retry_status.is_success() {
+                let sanitized = sanitize_lark_body(&retry_body);
                 anyhow::bail!(
-                    "Lark bot info request failed after token refresh: status={retry_status}, body={retry_body}"
+                    "Lark bot info request failed after token refresh: status={retry_status}, body={sanitized}"
                 );
             }
             retry_body
         } else {
             if !status.is_success() {
-                anyhow::bail!("Lark bot info request failed: status={status}, body={body}");
+                let sanitized = sanitize_lark_body(&body);
+                anyhow::bail!("Lark bot info request failed: status={status}, body={sanitized}");
             }
             body
         };
 
         let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            anyhow::bail!("Lark bot info failed: code={code}, body={body}");
+            let sanitized = sanitize_lark_body(&body);
+            anyhow::bail!("Lark bot info failed: code={code}, body={sanitized}");
         }
 
         let bot_open_id = body
@@ -1066,7 +1148,9 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
-    /// Parse an event callback payload and extract text messages
+    /// Parse an event callback payload and extract incoming messages.
+    ///
+    /// Synchronous parser uses a non-network fallback for image messages.
     pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
@@ -1102,7 +1186,7 @@ impl LarkChannel {
             return messages;
         }
 
-        // Extract message content (text and post supported)
+        // Extract message content (text/post/image supported)
         let msg_type = event
             .pointer("/message/message_type")
             .and_then(|t| t.as_str())
@@ -1133,6 +1217,7 @@ impl LarkChannel {
                 Some(details) => (details.text, details.mentioned_open_ids),
                 None => return messages,
             },
+            "image" => (LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT.to_string(), Vec::new()),
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
                 return messages;
@@ -1143,6 +1228,8 @@ impl LarkChannel {
         if chat_type == "group"
             && !should_respond_in_group(
                 self.mention_only,
+                open_id,
+                &self.group_reply_allowed_sender_ids,
                 bot_open_id.as_deref(),
                 &mentions,
                 &post_mentioned_open_ids,
@@ -1338,8 +1425,9 @@ impl Channel for LarkChannel {
                 self.send_text_once(&url, &new_token, &body).await?;
 
             if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                let sanitized = sanitize_lark_body(&retry_response);
                 anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                    "Lark send failed after token refresh: status={retry_status}, body={sanitized}"
                 );
             }
 
@@ -1405,7 +1493,7 @@ impl LarkChannel {
             }
 
             // Parse event messages
-            let messages = state.channel.parse_event_payload(&payload);
+            let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty() {
                 if let Some(message_id) = payload
                     .pointer("/event/message/message_id")
@@ -1462,6 +1550,7 @@ impl LarkChannel {
 // WS helper functions
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::cast_possible_truncation)]
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
     let upper = len as u64;
@@ -1802,13 +1891,41 @@ fn mention_matches_bot_open_id(mention: &serde_json::Value, bot_open_id: &str) -
         .is_some_and(|value| value == bot_open_id)
 }
 
-/// In group chats, only respond when the bot is explicitly @-mentioned.
+fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
+    let mut normalized = sender_ids
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn sender_has_group_reply_override(sender_open_id: &str, allowed_sender_ids: &[String]) -> bool {
+    let sender_open_id = sender_open_id.trim();
+    if sender_open_id.is_empty() {
+        return false;
+    }
+    allowed_sender_ids
+        .iter()
+        .any(|entry| entry == "*" || entry == sender_open_id)
+}
+
+/// Group-chat response policy:
+/// - sender override IDs always trigger
+/// - otherwise, mention gating applies when enabled
 fn should_respond_in_group(
     mention_only: bool,
+    sender_open_id: &str,
+    group_reply_allowed_sender_ids: &[String],
     bot_open_id: Option<&str>,
     mentions: &[serde_json::Value],
     post_mentioned_open_ids: &[String],
 ) -> bool {
+    if sender_has_group_reply_override(sender_open_id, group_reply_allowed_sender_ids) {
+        return true;
+    }
     if !mention_only {
         return true;
     }
@@ -1877,6 +1994,8 @@ mod tests {
         })];
         assert!(!should_respond_in_group(
             true,
+            "ou_user",
+            &[],
             Some("ou_bot"),
             &mentions,
             &[]
@@ -1887,6 +2006,8 @@ mod tests {
         })];
         assert!(should_respond_in_group(
             true,
+            "ou_user",
+            &[],
             Some("ou_bot"),
             &mentions,
             &[]
@@ -1898,16 +2019,37 @@ mod tests {
         let mentions = vec![serde_json::json!({
             "id": { "open_id": "ou_any" }
         })];
-        assert!(!should_respond_in_group(true, None, &mentions, &[]));
+        assert!(!should_respond_in_group(
+            true,
+            "ou_user",
+            &[],
+            None,
+            &mentions,
+            &[]
+        ));
     }
 
     #[test]
     fn lark_group_response_allows_post_mentions_for_bot_open_id() {
         assert!(should_respond_in_group(
             true,
+            "ou_user",
+            &[],
             Some("ou_bot"),
             &[],
             &[String::from("ou_bot")]
+        ));
+    }
+
+    #[test]
+    fn lark_group_response_allows_sender_override_without_mention() {
+        assert!(should_respond_in_group(
+            true,
+            "ou_priority_user",
+            &[String::from("ou_priority_user")],
+            Some("ou_bot"),
+            &[],
+            &[]
         ));
     }
 
@@ -2123,7 +2265,7 @@ mod tests {
     }
 
     #[test]
-    fn lark_parse_non_text_message_skipped() {
+    fn lark_parse_image_message_uses_fallback_text() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2145,7 +2287,35 @@ mod tests {
         });
 
         let msgs = ch.parse_event_payload(&payload);
-        assert!(msgs.is_empty());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT);
+    }
+
+    #[tokio::test]
+    async fn lark_parse_event_payload_async_image_missing_key_uses_fallback_text() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "image",
+                    "content": "{}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT);
     }
 
     #[test]
@@ -2290,8 +2460,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            draft_update_interval_ms: 3_000,
+            max_draft_edits: 20,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -2315,8 +2485,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            draft_update_interval_ms: 3_000,
+            max_draft_edits: 20,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -2352,8 +2522,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            draft_update_interval_ms: 3_000,
+            max_draft_edits: 20,
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -2379,8 +2549,8 @@ mod tests {
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            draft_update_interval_ms: 3_000,
+            max_draft_edits: 20,
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -2403,8 +2573,8 @@ mod tests {
             group_reply: None,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            draft_update_interval_ms: 3_000,
+            max_draft_edits: 20,
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -2578,8 +2748,8 @@ mod tests {
             group_reply: None,
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
-            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(),
-            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            draft_update_interval_ms: 3_000,
+            max_draft_edits: 20,
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(

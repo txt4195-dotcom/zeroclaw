@@ -948,7 +948,6 @@ pub(super) fn parse_glm_style_tool_calls(
                 }
             }
         }
-
     }
 
     calls
