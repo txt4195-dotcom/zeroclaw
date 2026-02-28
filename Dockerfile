@@ -161,7 +161,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install VS Code CLI (remote tunnel)
 RUN curl -fsSL "https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64" -o /tmp/vscode-cli.tar.gz && \
     tar -xzf /tmp/vscode-cli.tar.gz -C /usr/local/bin && \
-    rm /tmp/vscode-cli.tar.gz
+    rm /tmp/vscode-cli.tar.gz && \
+    ls -la /usr/local/bin/code && \
+    /usr/local/bin/code --version
 
 # Install noVNC
 RUN git clone --depth 1 https://github.com/novnc/noVNC.git /opt/noVNC && \
