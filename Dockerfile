@@ -159,7 +159,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install VS Code CLI (remote tunnel)
-RUN curl -fsSL "https://code.visualstudio.com/sha/download?build=stable&os=cli-linux-x64" -o /tmp/vscode-cli.tar.gz && \
+RUN curl -fsSL "https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64" -o /tmp/vscode-cli.tar.gz && \
     tar -xzf /tmp/vscode-cli.tar.gz -C /usr/local/bin && \
     rm /tmp/vscode-cli.tar.gz
 
