@@ -18,9 +18,9 @@ use crate::memory::{
     selectable_memory_backends, MemoryBackendKind,
 };
 use crate::providers::{
-    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
-    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
-    is_zai_cn_alias,
+    canonical_china_provider_name, is_doubao_alias, is_glm_alias, is_glm_cn_alias,
+    is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias,
+    is_siliconflow_alias, is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{bail, Context, Result};
 use console::style;
@@ -186,6 +186,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         proxy: crate::config::ProxyConfig::default(),
         identity: identity_config,
         cost: crate::config::CostConfig::default(),
+        economic: crate::config::EconomicConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
@@ -550,6 +551,7 @@ async fn run_quick_setup_with_home(
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
+        economic: crate::config::EconomicConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
@@ -710,6 +712,9 @@ fn canonical_provider_name(provider_name: &str) -> &str {
     }
 
     if let Some(canonical) = canonical_china_provider_name(provider_name) {
+        if canonical == "doubao" {
+            return "volcengine";
+        }
         return canonical;
     }
 
@@ -775,10 +780,13 @@ fn default_model_for_provider(provider: &str) -> String {
         "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
         "qwen" => "qwen-plus".into(),
+        "volcengine" => "doubao-1-5-pro-32k-250115".into(),
+        "siliconflow" => "Pro/zai-org/GLM-4.7".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "sglang" | "vllm" | "osaurus" => "default".into(),
+        "copilot" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -1088,6 +1096,31 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Qwen Turbo (fast and cost-efficient)".to_string(),
             ),
         ],
+        "volcengine" => vec![
+            (
+                "doubao-1-5-pro-32k-250115".to_string(),
+                "Doubao 1.5 Pro 32K (official sample model)".to_string(),
+            ),
+            (
+                "doubao-seed-1-6-250615".to_string(),
+                "Doubao Seed 1.6 (reasoning flagship)".to_string(),
+            ),
+            (
+                "deepseek-v3.2".to_string(),
+                "DeepSeek V3.2 (available in ARK catalog)".to_string(),
+            ),
+        ],
+        "siliconflow" => vec![
+            (
+                "Pro/zai-org/GLM-4.7".to_string(),
+                "GLM-4.7 Pro (official API example)".to_string(),
+            ),
+            (
+                "Pro/deepseek-ai/DeepSeek-V3.2".to_string(),
+                "DeepSeek V3.2 Pro".to_string(),
+            ),
+            ("Qwen/Qwen3-32B".to_string(), "Qwen3 32B".to_string()),
+        ],
         "qwen-code" => vec![
             (
                 "qwen3-coder-plus".to_string(),
@@ -1225,6 +1258,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Gemini 2.5 Flash-Lite (lowest cost)".to_string(),
             ),
         ],
+        "copilot" => vec![(
+            "default".to_string(),
+            "Copilot default model (recommended)".to_string(),
+        )],
         _ => vec![("default".to_string(), "Default model".to_string())],
     }
 }
@@ -1260,6 +1297,8 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "glm"
             | "zai"
             | "qwen"
+            | "volcengine"
+            | "siliconflow"
             | "nvidia"
     )
 }
@@ -1272,6 +1311,9 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
         "moonshot-cn" | "kimi-cn" => Some("https://api.moonshot.cn/v1/models"),
         "glm-cn" | "bigmodel" => Some("https://open.bigmodel.cn/api/paas/v4/models"),
         "zai-cn" | "z.ai-cn" => Some("https://open.bigmodel.cn/api/coding/paas/v4/models"),
+        "volcengine" | "ark" | "doubao" | "doubao-cn" => {
+            Some("https://ark.cn-beijing.volces.com/api/v3/models")
+        }
         _ => match canonical_provider_name(provider_name) {
             "openai-codex" | "openai" => Some("https://api.openai.com/v1/models"),
             "venice" => Some("https://api.venice.ai/api/v1/models"),
@@ -1287,6 +1329,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "glm" => Some("https://api.z.ai/api/paas/v4/models"),
             "zai" => Some("https://api.z.ai/api/coding/paas/v4/models"),
             "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
+            "siliconflow" => Some("https://api.siliconflow.cn/v1/models"),
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
@@ -2213,7 +2256,7 @@ async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
-        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
+        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini, GitHub Copilot)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
@@ -2239,6 +2282,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             (
                 "openai-codex",
                 "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
+            ),
+            (
+                "copilot",
+                "GitHub Copilot — OAuth device flow (Copilot subscription)",
             ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
@@ -2295,6 +2342,11 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("qwen-us", "Qwen — DashScope US endpoint"),
             ("hunyuan", "Hunyuan — Tencent large models (T1, Turbo, Pro)"),
             ("qianfan", "Qianfan — Baidu AI models (China endpoint)"),
+            ("volcengine", "Volcengine ARK — Doubao model family"),
+            (
+                "siliconflow",
+                "SiliconFlow — OpenAI-compatible hosted models",
+            ),
             ("zai", "Z.AI — global coding endpoint"),
             ("zai-cn", "Z.AI — China coding endpoint (open.bigmodel.cn)"),
             ("synthetic", "Synthetic — Synthetic AI models"),
@@ -2537,6 +2589,24 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         }
 
         key
+    } else if canonical_provider_name(provider_name) == "copilot" {
+        print_bullet("GitHub Copilot uses GitHub OAuth device flow.");
+        print_bullet("Press Enter to keep setup keyless and authenticate on first run.");
+        print_bullet("Optional: paste a GitHub token now to skip the first-run device prompt.");
+        println!();
+
+        let key: String = Input::new()
+            .with_prompt("  Paste your GitHub token (optional; Enter = device flow)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(
+                "No token provided. ZeroClaw will open the GitHub device login flow on first use.",
+            );
+        }
+
+        key
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -2671,6 +2741,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
         } else if is_qianfan_alias(provider_name) {
             "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/7lm0vxo78"
+        } else if is_doubao_alias(provider_name) {
+            "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey"
+        } else if is_siliconflow_alias(provider_name) {
+            "https://cloud.siliconflow.cn/account/ak"
         } else {
             match provider_name {
                 "openrouter" => "https://openrouter.ai/keys",
@@ -2979,6 +3053,8 @@ fn provider_env_var(name: &str) -> &'static str {
         "glm" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
         "qwen" => "DASHSCOPE_API_KEY",
+        "volcengine" => "ARK_API_KEY",
+        "siliconflow" => "SILICONFLOW_API_KEY",
         "hunyuan" => "HUNYUAN_API_KEY",
         "qianfan" => "QIANFAN_API_KEY",
         "zai" => "ZAI_API_KEY",
@@ -3649,6 +3725,7 @@ fn setup_identity_backend() -> Result<IdentityConfig> {
         );
         IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some(default_path),
             aieos_inline: None,
         }
@@ -3660,6 +3737,7 @@ fn setup_identity_backend() -> Result<IdentityConfig> {
         );
         IdentityConfig {
             format: "openclaw".into(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: None,
         }
@@ -6094,8 +6172,19 @@ fn print_summary(config: &Config) {
     let mut step = 1u8;
 
     let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let canonical_provider = canonical_provider_name(provider);
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
-        if provider == "openai-codex" {
+        if canonical_provider == "copilot" {
+            println!(
+                "    {} Authenticate GitHub Copilot:",
+                style(format!("{step}.")).cyan().bold()
+            );
+            println!("       {}", style("zeroclaw agent -m \"Hello!\"").yellow());
+            println!(
+                "       {}",
+                style("(device/OAuth prompt appears automatically on first run)").dim()
+            );
+        } else if canonical_provider == "openai-codex" {
             println!(
                 "    {} Authenticate OpenAI Codex:",
                 style(format!("{step}.")).cyan().bold()
@@ -6104,7 +6193,7 @@ fn print_summary(config: &Config) {
                 "       {}",
                 style("zeroclaw auth login --provider openai-codex --device-code").yellow()
             );
-        } else if provider == "anthropic" {
+        } else if canonical_provider == "anthropic" {
             println!(
                 "    {} Configure Anthropic auth:",
                 style(format!("{step}.")).cyan().bold()
@@ -6576,6 +6665,7 @@ mod tests {
         };
         let identity_config = crate::config::IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("identity.aieos.json".into()),
             aieos_inline: None,
         };
@@ -6605,6 +6695,7 @@ mod tests {
         let ctx = ProjectContext::default();
         let identity_config = crate::config::IdentityConfig {
             format: "aieos".into(),
+            extra_files: Vec::new(),
             aieos_path: Some("identity.aieos.json".into()),
             aieos_inline: None,
         };
@@ -7250,6 +7341,7 @@ mod tests {
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("copilot"), "default");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
         assert_eq!(
             default_model_for_provider("bedrock"),
@@ -7263,6 +7355,14 @@ mod tests {
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
         assert_eq!(default_model_for_provider("hunyuan"), "hunyuan-t1-latest");
         assert_eq!(default_model_for_provider("tencent"), "hunyuan-t1-latest");
+        assert_eq!(
+            default_model_for_provider("siliconflow"),
+            "Pro/zai-org/GLM-4.7"
+        );
+        assert_eq!(
+            default_model_for_provider("volcengine"),
+            "doubao-1-5-pro-32k-250115"
+        );
         assert_eq!(
             default_model_for_provider("nvidia"),
             "meta/llama-3.3-70b-instruct"
@@ -7301,6 +7401,10 @@ mod tests {
         assert_eq!(canonical_provider_name("minimax-cn"), "minimax");
         assert_eq!(canonical_provider_name("zai-cn"), "zai");
         assert_eq!(canonical_provider_name("z.ai-global"), "zai");
+        assert_eq!(canonical_provider_name("doubao"), "volcengine");
+        assert_eq!(canonical_provider_name("ark"), "volcengine");
+        assert_eq!(canonical_provider_name("silicon-cloud"), "siliconflow");
+        assert_eq!(canonical_provider_name("siliconcloud"), "siliconflow");
         assert_eq!(canonical_provider_name("nvidia-nim"), "nvidia");
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
@@ -7341,6 +7445,18 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_have_default_entry() {
+        let models = curated_models_for_provider("copilot");
+        assert_eq!(
+            models,
+            vec![(
+                "default".to_string(),
+                "Copilot default model (recommended)".to_string(),
+            )]
+        );
     }
 
     #[test]
@@ -7432,6 +7548,23 @@ mod tests {
     }
 
     #[test]
+    fn curated_models_for_volcengine_and_siliconflow_include_expected_defaults() {
+        let volcengine_ids: Vec<String> = curated_models_for_provider("volcengine")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(volcengine_ids.contains(&"doubao-1-5-pro-32k-250115".to_string()));
+        assert!(volcengine_ids.contains(&"doubao-seed-1-6-250615".to_string()));
+
+        let siliconflow_ids: Vec<String> = curated_models_for_provider("siliconflow")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(siliconflow_ids.contains(&"Pro/zai-org/GLM-4.7".to_string()));
+        assert!(siliconflow_ids.contains(&"Pro/deepseek-ai/DeepSeek-V3.2".to_string()));
+    }
+
+    #[test]
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
@@ -7452,6 +7585,11 @@ mod tests {
         assert!(supports_live_model_fetch("glm-cn"));
         assert!(supports_live_model_fetch("qwen-intl"));
         assert!(supports_live_model_fetch("qwen-coding-plan"));
+        assert!(supports_live_model_fetch("siliconflow"));
+        assert!(supports_live_model_fetch("silicon-cloud"));
+        assert!(supports_live_model_fetch("volcengine"));
+        assert!(supports_live_model_fetch("doubao"));
+        assert!(supports_live_model_fetch("ark"));
         assert!(!supports_live_model_fetch("minimax-cn"));
         assert!(!supports_live_model_fetch("unknown-provider"));
     }
@@ -7510,6 +7648,22 @@ mod tests {
             curated_models_for_provider("bedrock"),
             curated_models_for_provider("aws-bedrock")
         );
+        assert_eq!(
+            curated_models_for_provider("volcengine"),
+            curated_models_for_provider("doubao")
+        );
+        assert_eq!(
+            curated_models_for_provider("volcengine"),
+            curated_models_for_provider("ark")
+        );
+        assert_eq!(
+            curated_models_for_provider("siliconflow"),
+            curated_models_for_provider("silicon-cloud")
+        );
+        assert_eq!(
+            curated_models_for_provider("siliconflow"),
+            curated_models_for_provider("siliconcloud")
+        );
     }
 
     #[test]
@@ -7542,6 +7696,18 @@ mod tests {
             models_endpoint_for_provider("qwen-coding-plan"),
             Some("https://coding.dashscope.aliyuncs.com/v1/models")
         );
+        assert_eq!(
+            models_endpoint_for_provider("volcengine"),
+            Some("https://ark.cn-beijing.volces.com/api/v3/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("doubao"),
+            Some("https://ark.cn-beijing.volces.com/api/v3/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("ark"),
+            Some("https://ark.cn-beijing.volces.com/api/v3/models")
+        );
     }
 
     #[test]
@@ -7561,6 +7727,14 @@ mod tests {
         assert_eq!(
             models_endpoint_for_provider("moonshot"),
             Some("https://api.moonshot.ai/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("siliconflow"),
+            Some("https://api.siliconflow.cn/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("silicon-cloud"),
+            Some("https://api.siliconflow.cn/v1/models")
         );
         assert_eq!(
             models_endpoint_for_provider("llamacpp"),
@@ -7860,6 +8034,12 @@ mod tests {
         assert_eq!(provider_env_var("minimax-oauth-cn"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
         assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
+        assert_eq!(provider_env_var("doubao"), "ARK_API_KEY");
+        assert_eq!(provider_env_var("volcengine"), "ARK_API_KEY");
+        assert_eq!(provider_env_var("ark"), "ARK_API_KEY");
+        assert_eq!(provider_env_var("siliconflow"), "SILICONFLOW_API_KEY");
+        assert_eq!(provider_env_var("silicon-cloud"), "SILICONFLOW_API_KEY");
+        assert_eq!(provider_env_var("siliconcloud"), "SILICONFLOW_API_KEY");
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
@@ -7952,13 +8132,14 @@ mod tests {
     }
 
     #[test]
-    fn channel_menu_choices_include_signal_and_nextcloud_talk() {
+    fn channel_menu_choices_include_signal_nextcloud_and_dingtalk() {
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::DingTalk));
     }
 
     #[test]
-    fn launchable_channels_include_signal_mattermost_qq_and_nextcloud_talk() {
+    fn launchable_channels_include_signal_mattermost_qq_nextcloud_and_dingtalk() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
@@ -7999,6 +8180,14 @@ mod tests {
             base_url: "https://cloud.example.com".into(),
             app_token: "token".into(),
             webhook_secret: Some("secret".into()),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.nextcloud_talk = None;
+        channels.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            client_id: "client-id".into(),
+            client_secret: "client-secret".into(),
             allowed_users: vec!["*".into()],
         });
         assert!(has_launchable_channels(&channels));

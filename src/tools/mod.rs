@@ -430,6 +430,7 @@ pub fn all_tools_with_runtime(
         let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
             auth_profile_override: None,
             provider_api_url: root_config.api_url.clone(),
+            provider_transport: root_config.effective_provider_transport(),
             zeroclaw_dir: root_config
                 .config_path
                 .parent()
@@ -512,29 +513,6 @@ pub fn all_tools_with_runtime(
             subagent_registry,
             security.clone(),
         )));
-    }
-
-    // Inter-process agent communication (opt-in)
-    if root_config.agents_ipc.enabled {
-        match agents_ipc::IpcDb::open(workspace_dir, &root_config.agents_ipc) {
-            Ok(ipc_db) => {
-                let ipc_db = Arc::new(ipc_db);
-                tool_arcs.push(Arc::new(agents_ipc::AgentsListTool::new(ipc_db.clone())));
-                tool_arcs.push(Arc::new(agents_ipc::AgentsSendTool::new(
-                    ipc_db.clone(),
-                    security.clone(),
-                )));
-                tool_arcs.push(Arc::new(agents_ipc::AgentsInboxTool::new(ipc_db.clone())));
-                tool_arcs.push(Arc::new(agents_ipc::StateGetTool::new(ipc_db.clone())));
-                tool_arcs.push(Arc::new(agents_ipc::StateSetTool::new(
-                    ipc_db,
-                    security.clone(),
-                )));
-            }
-            Err(e) => {
-                tracing::warn!("agents_ipc: failed to open IPC database: {e}");
-            }
-        }
     }
 
     // Feishu document tools (enabled when channel-lark feature is active)

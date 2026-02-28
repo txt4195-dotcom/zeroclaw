@@ -461,9 +461,6 @@ impl FeishuDocTool {
             .await?;
         let row_size = required_usize(args, "row_size")?;
         let column_size = required_usize(args, "column_size")?;
-        if row_size == 0 || column_size == 0 {
-            anyhow::bail!("'row_size' and 'column_size' must be greater than 0");
-        }
         let column_width = parse_column_width(args)?;
 
         let mut property = json!({
@@ -868,8 +865,9 @@ impl FeishuDocTool {
             "external_access_entity": "open"
         });
         let query = [("type", "docx".to_string())];
-        self.authed_request_with_query(Method::PATCH, &url, Some(body), Some(&query))
-            .await?;
+        let _ = self
+            .authed_request_with_query(Method::PATCH, &url, Some(body), Some(&query))
+            .await;
         Ok(())
     }
 
@@ -979,8 +977,6 @@ impl FeishuDocTool {
         // (an attacker could redirect to internal/private IPs after initial URL validation)
         let no_redirect_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build no-redirect HTTP client: {}", e))?;
         let mut resp = no_redirect_client.get(url).send().await?;

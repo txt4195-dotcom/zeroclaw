@@ -237,6 +237,11 @@ pub struct Config {
     #[serde(default)]
     pub cost: CostConfig,
 
+    /// Economic agent survival tracking (`[economic]`).
+    /// Tracks balance, token costs, work income, and survival status.
+    #[serde(default)]
+    pub economic: EconomicConfig,
+
     /// Peripheral board configuration for hardware integration (`[peripherals]`).
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
@@ -309,6 +314,20 @@ pub struct ProviderConfig {
     /// (e.g. OpenAI Codex `/responses` reasoning effort).
     #[serde(default)]
     pub reasoning_level: Option<String>,
+    /// Optional transport override for providers that support multiple transports.
+    /// Supported values: "auto", "websocket", "sse".
+    ///
+    /// Resolution order:
+    /// 1) `model_routes[].transport` (route-specific)
+    /// 2) env overrides (`PROVIDER_TRANSPORT`, `ZEROCLAW_PROVIDER_TRANSPORT`, `ZEROCLAW_CODEX_TRANSPORT`)
+    /// 3) `provider.transport`
+    /// 4) runtime default (`auto`, WebSocket-first with SSE fallback for OpenAI Codex)
+    ///
+    /// Note: env overrides replace configured `provider.transport` when set.
+    ///
+    /// Existing configs that omit `provider.transport` remain valid and fall back to defaults.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -508,6 +527,11 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
+    /// API key used for transcription requests.
+    ///
+    /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Whisper API endpoint URL.
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
@@ -526,6 +550,7 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
@@ -708,6 +733,21 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Loop detection: no-progress repeat threshold.
+    /// Triggers when the same tool+args produces identical output this many times.
+    /// Set to `0` to disable. Default: `3`.
+    #[serde(default = "default_loop_detection_no_progress_threshold")]
+    pub loop_detection_no_progress_threshold: usize,
+    /// Loop detection: ping-pong cycle threshold.
+    /// Detects A→B→A→B alternating patterns with no progress.
+    /// Value is number of full cycles (A-B = 1 cycle). Set to `0` to disable. Default: `2`.
+    #[serde(default = "default_loop_detection_ping_pong_cycles")]
+    pub loop_detection_ping_pong_cycles: usize,
+    /// Loop detection: consecutive failure streak threshold.
+    /// Triggers when the same tool fails this many times in a row.
+    /// Set to `0` to disable. Default: `3`.
+    #[serde(default = "default_loop_detection_failure_streak")]
+    pub loop_detection_failure_streak: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -722,6 +762,18 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_loop_detection_no_progress_threshold() -> usize {
+    3
+}
+
+fn default_loop_detection_ping_pong_cycles() -> usize {
+    2
+}
+
+fn default_loop_detection_failure_streak() -> usize {
+    3
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -730,6 +782,9 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),
+            loop_detection_ping_pong_cycles: default_loop_detection_ping_pong_cycles(),
+            loop_detection_failure_streak: default_loop_detection_failure_streak(),
         }
     }
 }
@@ -877,6 +932,11 @@ pub struct IdentityConfig {
     /// Identity format: "openclaw" (default) or "aieos"
     #[serde(default = "default_identity_format")]
     pub format: String,
+    /// Additional workspace files injected for the OpenClaw identity format.
+    ///
+    /// Paths are resolved relative to the workspace root.
+    #[serde(default)]
+    pub extra_files: Vec<String>,
     /// Path to AIEOS JSON file (relative to workspace)
     #[serde(default)]
     pub aieos_path: Option<String>,
@@ -893,6 +953,7 @@ impl Default for IdentityConfig {
     fn default() -> Self {
         Self {
             format: default_identity_format(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: None,
         }
@@ -1075,6 +1136,83 @@ pub struct PeripheralBoardConfig {
     /// Baud rate for serial (default: 115200)
     #[serde(default = "default_peripheral_baud")]
     pub baud: u32,
+}
+
+// ── Economic Agent Config ─────────────────────────────────────────
+
+/// Token pricing configuration for economic tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EconomicTokenPricing {
+    /// Price per million input tokens (USD)
+    #[serde(default = "default_input_price")]
+    pub input_price_per_million: f64,
+    /// Price per million output tokens (USD)
+    #[serde(default = "default_output_price")]
+    pub output_price_per_million: f64,
+}
+
+fn default_input_price() -> f64 {
+    3.0 // Claude Sonnet 4 input price
+}
+
+fn default_output_price() -> f64 {
+    15.0 // Claude Sonnet 4 output price
+}
+
+impl Default for EconomicTokenPricing {
+    fn default() -> Self {
+        Self {
+            input_price_per_million: default_input_price(),
+            output_price_per_million: default_output_price(),
+        }
+    }
+}
+
+/// Economic agent survival tracking configuration (`[economic]` section).
+///
+/// Implements the ClawWork economic model for AI agents, tracking
+/// balance, costs, income, and survival status.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EconomicConfig {
+    /// Enable economic tracking (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Starting balance in USD (default: 1000.0)
+    #[serde(default = "default_initial_balance")]
+    pub initial_balance: f64,
+
+    /// Token pricing configuration
+    #[serde(default)]
+    pub token_pricing: EconomicTokenPricing,
+
+    /// Minimum evaluation score (0.0-1.0) to receive payment (default: 0.6)
+    #[serde(default = "default_min_evaluation_threshold")]
+    pub min_evaluation_threshold: f64,
+
+    /// Data directory for economic state persistence (relative to workspace)
+    #[serde(default)]
+    pub data_path: Option<String>,
+}
+
+fn default_initial_balance() -> f64 {
+    1000.0
+}
+
+fn default_min_evaluation_threshold() -> f64 {
+    0.6
+}
+
+impl Default for EconomicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            initial_balance: default_initial_balance(),
+            token_pricing: EconomicTokenPricing::default(),
+            min_evaluation_threshold: default_min_evaluation_threshold(),
+            data_path: None,
+        }
+    }
 }
 
 fn default_peripheral_transport() -> String {
@@ -2116,7 +2254,7 @@ impl Default for StorageProviderConfig {
 /// Controls conversation memory storage, embeddings, hybrid search, response caching,
 /// and memory snapshot/hydration.
 /// Configuration for Qdrant vector database backend (`[memory.qdrant]`).
-/// Used when `[memory].backend = "qdrant"`.
+/// Used when `[memory].backend = "qdrant"` or `"sqlite_qdrant_hybrid"`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QdrantConfig {
     /// Qdrant server URL (e.g. "http://localhost:6333").
@@ -2150,10 +2288,10 @@ impl Default for QdrantConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "sqlite_qdrant_hybrid" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
-    /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
+    /// `qdrant` and `sqlite_qdrant_hybrid` use `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
@@ -2226,7 +2364,7 @@ pub struct MemoryConfig {
 
     // ── Qdrant backend options ─────────────────────────────────
     /// Configuration for Qdrant vector database backend.
-    /// Only used when `backend = "qdrant"`.
+    /// Used when `backend = "qdrant"` or `backend = "sqlite_qdrant_hybrid"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
 }
@@ -3183,6 +3321,14 @@ pub struct ModelRouteConfig {
     /// Optional API key override for this route's provider
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Optional route-specific transport override for this route.
+    /// Supported values: "auto", "websocket", "sse".
+    ///
+    /// When `model_routes[].transport` is unset, the route inherits `provider.transport`.
+    /// If both are unset, runtime defaults are used (`auto` for OpenAI Codex).
+    /// Existing configs without this field remain valid.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 // ── Embedding routing ───────────────────────────────────────────
@@ -5052,6 +5198,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
+            economic: EconomicConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             coordination: CoordinationConfig::default(),
@@ -5916,6 +6063,11 @@ impl Config {
             decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
             decrypt_optional_secret(
                 &store,
+                &mut config.transcription.api_key,
+                "config.transcription.api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
@@ -6024,6 +6176,28 @@ impl Config {
         }
     }
 
+    fn normalize_provider_transport(raw: Option<&str>, source: &str) -> Option<String> {
+        let value = raw?.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
+        match normalized.as_str() {
+            "auto" => Some("auto".to_string()),
+            "websocket" | "ws" => Some("websocket".to_string()),
+            "sse" | "http" => Some("sse".to_string()),
+            _ => {
+                tracing::warn!(
+                    transport = %value,
+                    source,
+                    "Ignoring invalid provider transport override"
+                );
+                None
+            }
+        }
+    }
+
     /// Resolve provider reasoning level with backward-compatible runtime alias.
     ///
     /// Priority:
@@ -6065,6 +6239,16 @@ impl Config {
             }
             (None, None) => None,
         }
+    }
+
+    /// Resolve provider transport mode (`provider.transport`).
+    ///
+    /// Supported values:
+    /// - `auto`
+    /// - `websocket`
+    /// - `sse`
+    pub fn effective_provider_transport(&self) -> Option<String> {
+        Self::normalize_provider_transport(self.provider.transport.as_deref(), "provider.transport")
     }
 
     fn lookup_model_provider_profile(
@@ -6430,6 +6614,32 @@ impl Config {
             if route.max_tokens == Some(0) {
                 anyhow::bail!("model_routes[{i}].max_tokens must be greater than 0");
             }
+            if route
+                .transport
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && Self::normalize_provider_transport(
+                    route.transport.as_deref(),
+                    "model_routes[].transport",
+                )
+                .is_none()
+            {
+                anyhow::bail!("model_routes[{i}].transport must be one of: auto, websocket, sse");
+            }
+        }
+
+        if self
+            .provider
+            .transport
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && Self::normalize_provider_transport(
+                self.provider.transport.as_deref(),
+                "provider.transport",
+            )
+            .is_none()
+        {
+            anyhow::bail!("provider.transport must be one of: auto, websocket, sse");
         }
 
         if self.provider_api.is_some()
@@ -6761,6 +6971,17 @@ impl Config {
             }
         }
 
+        // Provider transport override: ZEROCLAW_PROVIDER_TRANSPORT or PROVIDER_TRANSPORT
+        if let Ok(transport) = std::env::var("ZEROCLAW_PROVIDER_TRANSPORT")
+            .or_else(|_| std::env::var("PROVIDER_TRANSPORT"))
+        {
+            if let Some(normalized) =
+                Self::normalize_provider_transport(Some(&transport), "env:provider_transport")
+            {
+                self.provider.transport = Some(normalized);
+            }
+        }
+
         // Vision support override: ZEROCLAW_MODEL_SUPPORT_VISION or MODEL_SUPPORT_VISION
         if let Ok(flag) = std::env::var("ZEROCLAW_MODEL_SUPPORT_VISION")
             .or_else(|_| std::env::var("MODEL_SUPPORT_VISION"))
@@ -6926,6 +7147,11 @@ impl Config {
         let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
 
         encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.transcription.api_key,
+            "config.transcription.api_key",
+        )?;
         encrypt_optional_secret(
             &store,
             &mut config_to_save.composio.api_key,
@@ -7604,6 +7830,7 @@ default_temperature = 0.7
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
+            economic: EconomicConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
@@ -7975,6 +8202,7 @@ tool_dispatcher = "xml"
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
+            economic: EconomicConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
@@ -8016,6 +8244,7 @@ tool_dispatcher = "xml"
         config.workspace_dir = dir.join("workspace");
         config.config_path = dir.join("config.toml");
         config.api_key = Some("root-credential".into());
+        config.transcription.api_key = Some("transcription-credential".into());
         config.composio.api_key = Some("composio-credential".into());
         config.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".into());
         config.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".into());
@@ -8062,6 +8291,15 @@ tool_dispatcher = "xml"
         let root_encrypted = stored.api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(root_encrypted));
         assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
+
+        let transcription_encrypted = stored.transcription.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            transcription_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(transcription_encrypted).unwrap(),
+            "transcription-credential"
+        );
 
         let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(
@@ -9344,6 +9582,7 @@ provider_api = "not-a-real-mode"
             model: "anthropic/claude-sonnet-4.6".to_string(),
             max_tokens: Some(0),
             api_key: None,
+            transport: None,
         }];
 
         let err = config
@@ -9352,6 +9591,48 @@ provider_api = "not-a-real-mode"
         assert!(err
             .to_string()
             .contains("model_routes[0].max_tokens must be greater than 0"));
+    }
+
+    #[test]
+    async fn provider_transport_normalizes_aliases() {
+        let mut config = Config::default();
+        config.provider.transport = Some("WS".to_string());
+        assert_eq!(
+            config.effective_provider_transport().as_deref(),
+            Some("websocket")
+        );
+    }
+
+    #[test]
+    async fn provider_transport_invalid_is_rejected() {
+        let mut config = Config::default();
+        config.provider.transport = Some("udp".to_string());
+        let err = config
+            .validate()
+            .expect_err("provider.transport should reject invalid values");
+        assert!(err
+            .to_string()
+            .contains("provider.transport must be one of: auto, websocket, sse"));
+    }
+
+    #[test]
+    async fn model_route_transport_invalid_is_rejected() {
+        let mut config = Config::default();
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-sonnet-4.6".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: Some("udp".to_string()),
+        }];
+
+        let err = config
+            .validate()
+            .expect_err("model_routes[].transport should reject invalid values");
+        assert!(err
+            .to_string()
+            .contains("model_routes[0].transport must be one of: auto, websocket, sse"));
     }
 
     #[test]
@@ -9995,6 +10276,60 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn env_override_provider_transport_normalizes_zeroclaw_alias() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::remove_var("PROVIDER_TRANSPORT");
+        std::env::set_var("ZEROCLAW_PROVIDER_TRANSPORT", "WS");
+        config.apply_env_overrides();
+        assert_eq!(config.provider.transport.as_deref(), Some("websocket"));
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_TRANSPORT");
+    }
+
+    #[test]
+    async fn env_override_provider_transport_normalizes_legacy_alias() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_TRANSPORT");
+        std::env::set_var("PROVIDER_TRANSPORT", "HTTP");
+        config.apply_env_overrides();
+        assert_eq!(config.provider.transport.as_deref(), Some("sse"));
+
+        std::env::remove_var("PROVIDER_TRANSPORT");
+    }
+
+    #[test]
+    async fn env_override_provider_transport_invalid_zeroclaw_does_not_override_existing() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.provider.transport = Some("sse".to_string());
+
+        std::env::remove_var("PROVIDER_TRANSPORT");
+        std::env::set_var("ZEROCLAW_PROVIDER_TRANSPORT", "udp");
+        config.apply_env_overrides();
+        assert_eq!(config.provider.transport.as_deref(), Some("sse"));
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_TRANSPORT");
+    }
+
+    #[test]
+    async fn env_override_provider_transport_invalid_legacy_does_not_override_existing() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.provider.transport = Some("auto".to_string());
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_TRANSPORT");
+        std::env::set_var("PROVIDER_TRANSPORT", "udp");
+        config.apply_env_overrides();
+        assert_eq!(config.provider.transport.as_deref(), Some("auto"));
+
+        std::env::remove_var("PROVIDER_TRANSPORT");
+    }
+
+    #[test]
     async fn env_override_model_support_vision() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -10489,6 +10824,46 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn dingtalk_config_defaults_allowed_users_to_empty() {
+        let json = r#"{"client_id":"ding-app-key","client_secret":"ding-app-secret"}"#;
+        let parsed: DingTalkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.client_id, "ding-app-key");
+        assert_eq!(parsed.client_secret, "ding-app-secret");
+        assert!(parsed.allowed_users.is_empty());
+    }
+
+    #[test]
+    async fn dingtalk_config_toml_roundtrip() {
+        let dc = DingTalkConfig {
+            client_id: "ding-app-key".into(),
+            client_secret: "ding-app-secret".into(),
+            allowed_users: vec!["*".into(), "staff123".into()],
+        };
+        let toml_str = toml::to_string(&dc).unwrap();
+        let parsed: DingTalkConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.client_id, "ding-app-key");
+        assert_eq!(parsed.client_secret, "ding-app-secret");
+        assert_eq!(parsed.allowed_users, vec!["*", "staff123"]);
+    }
+
+    #[test]
+    async fn channels_except_webhook_reports_dingtalk_as_enabled() {
+        let mut channels = ChannelsConfig::default();
+        channels.dingtalk = Some(DingTalkConfig {
+            client_id: "ding-app-key".into(),
+            client_secret: "ding-app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+
+        let dingtalk_state = channels
+            .channels_except_webhook()
+            .iter()
+            .find_map(|(handle, enabled)| (handle.name() == "DingTalk").then_some(*enabled));
+
+        assert_eq!(dingtalk_state, Some(true));
+    }
+
+    #[test]
     async fn nextcloud_talk_config_serde() {
         let nc = NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
@@ -10594,6 +10969,7 @@ default_model = "legacy-model"
     async fn transcription_config_defaults() {
         let tc = TranscriptionConfig::default();
         assert!(!tc.enabled);
+        assert!(tc.api_key.is_none());
         assert!(tc.api_url.contains("groq.com"));
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
@@ -10604,12 +10980,17 @@ default_model = "legacy-model"
     async fn config_roundtrip_with_transcription() {
         let mut config = Config::default();
         config.transcription.enabled = true;
+        config.transcription.api_key = Some("transcription-key".into());
         config.transcription.language = Some("en".into());
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
 
         assert!(parsed.transcription.enabled);
+        assert_eq!(
+            parsed.transcription.api_key.as_deref(),
+            Some("transcription-key")
+        );
         assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
         assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
     }
