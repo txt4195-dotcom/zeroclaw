@@ -138,3 +138,38 @@ USER 65534:65534
 EXPOSE 42617
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
+
+# ── Stage 4: Spore (Browser + VNC + Telegram) ─────────────────
+FROM dev AS spore
+
+USER root
+
+# Install Chromium, Xvfb, VNC, nginx, Node.js
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    xvfb \
+    x11vnc \
+    nginx \
+    nodejs \
+    npm \
+    git \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install noVNC
+RUN git clone --depth 1 https://github.com/novnc/noVNC.git /opt/noVNC && \
+    git clone --depth 1 https://github.com/novnc/websockify.git /opt/noVNC/utils/websockify && \
+    ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html
+
+# Copy spore scripts
+COPY start-spore.sh /app/start-spore.sh
+COPY nginx-spore.conf /etc/nginx/nginx-spore.conf
+RUN chmod +x /app/start-spore.sh
+
+# Environment
+ENV DISPLAY=:99
+ENV HOME=/zeroclaw-data
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+
+EXPOSE 8080
+ENTRYPOINT ["/app/start-spore.sh"]

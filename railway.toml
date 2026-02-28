@@ -1,0 +1,13 @@
+[build]
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# Railway dashboard: set Docker build target = "spore"
+# Volume persists ZeroClaw data (SQLite, memory, workspace, chrome sessions)
+
+[[mounts]]
+source = "zeroclaw-data"
+mountPath = "/zeroclaw-data"
