@@ -13,6 +13,8 @@ pub struct SlackChannel {
     app_token: Option<String>,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
+    mention_only: bool,
+    group_reply_allowed_sender_ids: Vec<String>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -32,7 +34,21 @@ impl SlackChannel {
             app_token,
             channel_id,
             allowed_users,
+            mention_only: false,
+            group_reply_allowed_sender_ids: Vec::new(),
         }
+    }
+
+    /// Configure group-chat trigger policy.
+    pub fn with_group_reply_policy(
+        mut self,
+        mention_only: bool,
+        allowed_sender_ids: Vec<String>,
+    ) -> Self {
+        self.mention_only = mention_only;
+        self.group_reply_allowed_sender_ids =
+            Self::normalize_group_reply_allowed_sender_ids(allowed_sender_ids);
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -44,6 +60,17 @@ impl SlackChannel {
     /// `"*"` means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    fn is_group_sender_trigger_enabled(&self, user_id: &str) -> bool {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return false;
+        }
+
+        self.group_reply_allowed_sender_ids
+            .iter()
+            .any(|entry| entry == "*" || entry == user_id)
     }
 
     /// Get the bot's own user ID so we can ignore our own messages
@@ -206,7 +233,8 @@ impl SlackChannel {
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
 
             if !status.is_success() {
-                anyhow::bail!("Slack conversations.list failed ({status}): {body}");
+                let sanitized = crate::providers::sanitize_api_error(&body);
+                anyhow::bail!("Slack conversations.list failed ({status}): {sanitized}");
             }
 
             let data: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
@@ -648,7 +676,8 @@ impl Channel for SlackChannel {
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
 
         if !status.is_success() {
-            anyhow::bail!("Slack chat.postMessage failed ({status}): {body}");
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            anyhow::bail!("Slack chat.postMessage failed ({status}): {sanitized}");
         }
 
         // Slack returns 200 for most app-level errors; check JSON "ok" field
@@ -779,13 +808,24 @@ impl Channel for SlackChannel {
                             continue;
                         }
 
+                        let is_group_message = Self::is_group_channel_id(&channel_id);
+                        let allow_sender_without_mention =
+                            is_group_message && self.is_group_sender_trigger_enabled(user);
+                        let require_mention =
+                            self.mention_only && is_group_message && !allow_sender_without_mention;
+                        let Some(normalized_text) =
+                            Self::normalize_incoming_content(text, require_mention, &bot_user_id)
+                        else {
+                            continue;
+                        };
+
                         last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
 
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
                             sender: user.to_string(),
                             reply_target: channel_id.clone(),
-                            content: text.to_string(),
+                            content: normalized_text,
                             channel: "slack".to_string(),
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -910,6 +950,23 @@ mod tests {
     fn wildcard_allows_everyone() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["*".into()]);
         assert!(ch.is_user_allowed("U12345"));
+    }
+
+    #[test]
+    fn normalize_incoming_content_requires_mention_when_enabled() {
+        assert!(SlackChannel::normalize_incoming_content("hello", true, "U_BOT").is_none());
+        assert_eq!(
+            SlackChannel::normalize_incoming_content("<@U_BOT> run", true, "U_BOT").as_deref(),
+            Some("run")
+        );
+    }
+
+    #[test]
+    fn normalize_incoming_content_without_mention_mode_keeps_message() {
+        assert_eq!(
+            SlackChannel::normalize_incoming_content("  hello world  ", false, "U_BOT").as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]
