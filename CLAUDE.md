@@ -533,3 +533,89 @@ When working in fast iterative mode:
 - Prefer deterministic behavior over clever shortcuts.
 - Do not “ship and hope” on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+
+---
+
+## 13) Fork: Spore Deployment (txt4195-dotcom/zeroclaw)
+
+This section is specific to the `txt4195-dotcom/zeroclaw` fork. Upstream: `zeroclaw-labs/zeroclaw`.
+
+### 13.1 Purpose
+
+Deploy ZeroClaw as the "Spore" runtime — a Railway-hosted container with browser automation (OpenChrome), remote GUI access (noVNC), and Telegram control channel.
+
+### 13.2 Spore-Specific Files
+
+| File | Role |
+|------|------|
+| `start-spore.sh` | Container entrypoint: dirs → Xvfb → x11vnc → noVNC → nginx → `zeroclaw daemon` |
+| `nginx-spore.conf` | Port routing: `/` → gateway (:42617), `/vnc/` → noVNC (:6080) |
+| `railway.toml` | Railway deployment config with volume mount at `/zeroclaw-data` |
+| `Dockerfile` (stage `spore`) | `FROM dev AS spore` — adds Chromium, Xvfb, VNC, nginx, Node.js |
+| `.github/workflows/build-spore.yml` | CI: build `--target spore` → push to GHCR |
+
+### 13.3 Docker Multi-Stage Build
+
+```
+builder  → Rust release binary (cargo build --release --locked)
+dev      → Debian trixie-slim + binary + dev config
+release  → Distroless + binary + production config
+spore    → FROM dev + Chromium + Xvfb + noVNC + nginx
+```
+
+Build the spore image: `docker build --target spore -t zeroclaw:spore .`
+
+### 13.4 Upstream Sync
+
+```bash
+git fetch upstream main
+git rebase upstream/main
+git push origin main --force-with-lease
+```
+
+After syncing, always verify with `cargo check` before pushing.
+
+### 13.5 Config & Secret Management
+
+**No config files baked into the image.** All configuration is done via CLI after deployment:
+
+```bash
+railway shell
+zeroclaw onboard          # Interactive setup: API key, provider, Telegram, etc.
+```
+
+Config persists in the volume at `/zeroclaw-data/.zeroclaw/`.
+
+**Environment variable overrides (native):**
+- `ZEROCLAW_API_KEY` → api_key
+- `ZEROCLAW_PROVIDER` → default_provider
+- `ZEROCLAW_MODEL` → default_model
+
+**Railway env vars set:**
+- `RAILWAY_DOCKERFILE_TARGET=spore`
+- `ZEROCLAW_API_KEY=<key>`
+
+### 13.6 Railway Volume
+
+Single mount: `/zeroclaw-data` (source: `zeroclaw-spore-volume`)
+
+Contains:
+- `.zeroclaw/config.toml` — runtime config (set via `zeroclaw onboard`)
+- `.zeroclaw/.secret_key` — AES encryption key for SecretStore
+- `workspace/` — agent workspace files
+- `chrome-storage/` — Chrome profile (cookies, sessions, local storage)
+- SQLite databases (ZeroClaw memory)
+
+### 13.7 VNC Access (Chrome Login)
+
+`https://<railway-url>/vnc/` → noVNC → Chromium GUI
+
+Purpose: log into Google/other services in Chrome. Session persists in `/zeroclaw-data/chrome-storage/`.
+
+### 13.8 Post-Deploy Checklist
+
+1. `railway shell` → `zeroclaw onboard` (API key, provider, Telegram token)
+2. `https://<url>/vnc/` → Chrome에서 Google 로그인
+3. Telegram → message bot
+4. Verify: `https://<url>/` → ZeroClaw gateway 응답
+5. Restart → volume persist 확인 (설정 유지되는지)
