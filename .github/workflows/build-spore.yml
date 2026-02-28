@@ -44,6 +44,8 @@ jobs:
           context: .
           target: spore
           push: true
+          build-args: |
+            ZEROCLAW_CARGO_FEATURES=rag-pdf
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:spore
           cache-from: type=gha
