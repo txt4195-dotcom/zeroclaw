@@ -72,7 +72,10 @@ use crate::agent::loop_::{
     run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
 };
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
-use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
+use crate::config::{
+    ChannelCommandPolicyConfig, Config, NonCliNaturalLanguageApprovalMode, SessionConfig,
+    SessionDmScope, SessionHistoryScope,
+};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
@@ -197,6 +200,36 @@ enum ChannelRuntimeCommand {
     ListApprovals,
 }
 
+impl ChannelRuntimeCommand {
+    fn canonical_name(&self) -> &'static str {
+        match self {
+            ChannelRuntimeCommand::ShowProviders | ChannelRuntimeCommand::SetProvider(_) => {
+                "models"
+            }
+            ChannelRuntimeCommand::ShowModel | ChannelRuntimeCommand::SetModel(_) => "model",
+            ChannelRuntimeCommand::NewSession => "new",
+            ChannelRuntimeCommand::RequestAllToolsOnce => "approve-all-once",
+            ChannelRuntimeCommand::RequestToolApproval(_) => "approve-request",
+            ChannelRuntimeCommand::ConfirmToolApproval(_) => "approve-confirm",
+            ChannelRuntimeCommand::ApprovePendingRequest(_) => "approve-allow",
+            ChannelRuntimeCommand::DenyToolApproval(_) => "approve-deny",
+            ChannelRuntimeCommand::ListPendingApprovals => "approve-pending",
+            ChannelRuntimeCommand::ApproveTool(_) => "approve",
+            ChannelRuntimeCommand::UnapproveTool(_) => "unapprove",
+            ChannelRuntimeCommand::ListApprovals => "approvals",
+        }
+    }
+
+    fn config_write_capable(&self) -> bool {
+        matches!(
+            self,
+            ChannelRuntimeCommand::ApprovePendingRequest(_)
+                | ChannelRuntimeCommand::ApproveTool(_)
+                | ChannelRuntimeCommand::UnapproveTool(_)
+        )
+    }
+}
+
 const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -280,6 +313,8 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
+    session: SessionConfig,
+    command_policies: HashMap<String, ChannelCommandPolicyConfig>,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Mutex<Vec<String>>>,
     query_classification: crate::config::QueryClassificationConfig,
@@ -320,19 +355,51 @@ impl InFlightTaskCompletion {
     }
 }
 
-fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic memory isolation in forum groups
-    match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
-        None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
+fn canonical_session_identity(msg: &traits::ChannelMessage, session: &SessionConfig) -> String {
+    let scoped_identity = format!("{}:{}", msg.channel, msg.sender);
+    session
+        .identity_links
+        .get(&scoped_identity)
+        .or_else(|| session.identity_links.get(&msg.sender))
+        .cloned()
+        .unwrap_or_else(|| msg.sender.clone())
+}
+
+fn conversation_memory_key(msg: &traits::ChannelMessage, session: &SessionConfig) -> String {
+    let canonical_identity = canonical_session_identity(msg, session);
+    match session.dm_scope {
+        SessionDmScope::PerPeer => format!("{canonical_identity}_{}", msg.id),
+        SessionDmScope::PerChannelPeer => {
+            // Preserve legacy key shape for threaded channels under default scope.
+            match &msg.thread_ts {
+                Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, canonical_identity, msg.id),
+                None => format!("{}_{}_{}", msg.channel, canonical_identity, msg.id),
+            }
+        }
+        SessionDmScope::PerAccountChannelPeer => {
+            format!(
+                "{}_{}_{}_{}",
+                msg.channel, msg.reply_target, canonical_identity, msg.id
+            )
+        }
     }
 }
 
-fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic session isolation in forum groups
-    match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
-        None => format!("{}_{}", msg.channel, msg.sender),
+fn conversation_history_key(msg: &traits::ChannelMessage, session: &SessionConfig) -> String {
+    let canonical_identity = canonical_session_identity(msg, session);
+    match session.history_scope {
+        SessionHistoryScope::PerPeer => canonical_identity,
+        SessionHistoryScope::PerChannelPeer => format!("{}_{}", msg.channel, canonical_identity),
+        SessionHistoryScope::PerThreadPeer => match &msg.thread_ts {
+            Some(tid) => format!("{}_{}_{}", msg.channel, tid, canonical_identity),
+            None => format!("{}_{}", msg.channel, canonical_identity),
+        },
+        SessionHistoryScope::PerAccountChannelPeer => {
+            format!(
+                "{}_{}_{}",
+                msg.channel, msg.reply_target, canonical_identity
+            )
+        }
     }
 }
 
@@ -715,7 +782,53 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord")
 }
 
-fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
+fn normalize_runtime_command_name(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('/')
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn channel_command_policy_for<'a>(
+    command_policies: &'a HashMap<String, ChannelCommandPolicyConfig>,
+    channel_name: &str,
+) -> Option<&'a ChannelCommandPolicyConfig> {
+    command_policies.get(&channel_name.to_ascii_lowercase())
+}
+
+fn channel_policy_allows_model_switch(
+    channel_name: &str,
+    policy: Option<&ChannelCommandPolicyConfig>,
+) -> bool {
+    if supports_runtime_model_switch(channel_name) {
+        return true;
+    }
+    let Some(policy) = policy else {
+        return false;
+    };
+    if !policy.native {
+        return false;
+    }
+    if policy.allowed.is_empty() {
+        return true;
+    }
+    let allowed = policy
+        .allowed
+        .iter()
+        .map(|name| normalize_runtime_command_name(name))
+        .collect::<HashSet<_>>();
+    allowed.contains("models") || allowed.contains("model")
+}
+
+fn parse_runtime_command_with_policy(
+    channel_name: &str,
+    content: &str,
+    policy: Option<&ChannelCommandPolicyConfig>,
+) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
         return parse_natural_language_runtime_command(trimmed);
@@ -730,6 +843,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
     let args: Vec<&str> = parts.collect();
     let tail = args.join(" ").trim().to_string();
+    let supports_model_switch = channel_policy_allows_model_switch(channel_name, policy);
 
     match base_command.as_str() {
         // History reset commands are safe for all channels.
@@ -743,8 +857,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail)),
         "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
         "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
-        // Provider/model switching remains limited to channels with session routing.
-        "/models" if supports_runtime_model_switch(channel_name) => {
+        // Provider/model switching is policy-governed per channel.
+        "/models" if supports_model_switch => {
             if let Some(provider) = args.first() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -753,7 +867,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" if supports_runtime_model_switch(channel_name) => {
+        "/model" if supports_model_switch => {
             let model = tail;
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
@@ -763,6 +877,10 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         }
         _ => None,
     }
+}
+
+fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
+    parse_runtime_command_with_policy(channel_name, content, None)
 }
 
 fn is_runtime_token(value: &str) -> bool {
@@ -885,6 +1003,47 @@ fn is_approval_management_command(command: &ChannelRuntimeCommand) -> bool {
             | ChannelRuntimeCommand::UnapproveTool(_)
             | ChannelRuntimeCommand::ListApprovals
     )
+}
+
+fn runtime_command_policy_check(
+    command: &ChannelRuntimeCommand,
+    channel_name: &str,
+    policy: Option<&ChannelCommandPolicyConfig>,
+) -> Result<(), String> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+
+    if !policy.native {
+        return Err(format!(
+            "Runtime commands are disabled for channel `{channel_name}` by policy (`[channels_config.commands.{channel_name}].native = false`)."
+        ));
+    }
+
+    let command_name = command.canonical_name();
+    if !policy.allowed.is_empty() {
+        let allowed = policy
+            .allowed
+            .iter()
+            .map(|entry| normalize_runtime_command_name(entry))
+            .collect::<HashSet<_>>();
+        if !allowed.contains(command_name) {
+            let mut listed = allowed.into_iter().collect::<Vec<_>>();
+            listed.sort();
+            return Err(format!(
+                "Runtime command `/{command_name}` is not allowed on channel `{channel_name}`.\nAllowed commands: {}",
+                listed.join(", ")
+            ));
+        }
+    }
+
+    if command.config_write_capable() && !policy.config_writes {
+        return Err(format!(
+            "Runtime command `/{command_name}` is blocked because config-write commands are disabled for channel `{channel_name}` (`[channels_config.commands.{channel_name}].config_writes = false`)."
+        ));
+    }
+
+    Ok(())
 }
 
 fn non_cli_natural_language_mode_label(mode: NonCliNaturalLanguageApprovalMode) -> &'static str {
@@ -1908,7 +2067,11 @@ async fn handle_runtime_command_if_needed(
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> bool {
     let is_slash_command = msg.content.trim_start().starts_with('/');
-    let Some(mut command) = parse_runtime_command(&msg.channel, &msg.content) else {
+    let source_channel = msg.channel.as_str();
+    let command_policy = channel_command_policy_for(&ctx.command_policies, source_channel);
+    let Some(mut command) =
+        parse_runtime_command_with_policy(source_channel, &msg.content, command_policy)
+    else {
         return false;
     };
 
@@ -1916,10 +2079,36 @@ async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = conversation_history_key(msg);
+    if let Err(reason) = runtime_command_policy_check(&command, source_channel, command_policy) {
+        runtime_trace::record_event(
+            "runtime_command_policy_denied",
+            Some(source_channel),
+            None,
+            None,
+            None,
+            Some(false),
+            Some("runtime command blocked by channel policy"),
+            serde_json::json!({
+                "sender": msg.sender,
+                "channel": source_channel,
+                "command": command.canonical_name(),
+            }),
+        );
+        if let Err(err) = channel
+            .send(&SendMessage::new(reason, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .await
+        {
+            tracing::warn!(
+                "Failed to send runtime command response on {}: {err}",
+                channel.name()
+            );
+        }
+        return true;
+    }
+
+    let sender_key = conversation_history_key(msg, &ctx.session);
     let mut current = get_route_selection(ctx, &sender_key);
     let sender = msg.sender.as_str();
-    let source_channel = msg.channel.as_str();
     let reply_target = msg.reply_target.as_str();
     let is_natural_language_approval_command =
         !is_slash_command && is_approval_management_command(&command);
@@ -3098,7 +3287,7 @@ or tune thresholds in config.",
         }
     }
 
-    let history_key = conversation_history_key(&msg);
+    let history_key = conversation_history_key(&msg, &ctx.session);
     // Try classification first, fall back to sender/default route
     let route = classify_message_route(ctx.as_ref(), &msg.content)
         .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
@@ -3123,7 +3312,7 @@ or tune thresholds in config.",
         }
     };
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-        let autosave_key = conversation_memory_key(&msg);
+        let autosave_key = conversation_memory_key(&msg, &ctx.session);
         let _ = ctx
             .memory
             .store(
@@ -5165,6 +5354,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
+        session: config.session.clone(),
+        command_policies: config
+            .channels_config
+            .commands
+            .iter()
+            .map(|(channel, policy)| (channel.to_ascii_lowercase(), policy.clone()))
+            .collect(),
         hooks: if config.hooks.enabled {
             let mut runner = crate::hooks::HookRunner::new();
             if config.hooks.builtin.command_logger {
@@ -5379,6 +5575,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_runtime_command_policy_can_enable_model_switch_on_non_legacy_channel() {
+        assert_eq!(parse_runtime_command("slack", "/models openrouter"), None);
+
+        let policy = crate::config::ChannelCommandPolicyConfig {
+            native: true,
+            allowed: vec!["models".to_string(), "model".to_string()],
+            config_writes: true,
+        };
+        assert_eq!(
+            parse_runtime_command_with_policy("slack", "/models openrouter", Some(&policy)),
+            Some(ChannelRuntimeCommand::SetProvider("openrouter".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command_with_policy("slack", "/model gpt-4.1", Some(&policy)),
+            Some(ChannelRuntimeCommand::SetModel("gpt-4.1".to_string()))
+        );
+    }
+
+    #[test]
+    fn runtime_command_policy_check_enforces_allowed_list() {
+        let policy = crate::config::ChannelCommandPolicyConfig {
+            native: true,
+            allowed: vec!["new".to_string()],
+            config_writes: true,
+        };
+        assert!(runtime_command_policy_check(
+            &ChannelRuntimeCommand::NewSession,
+            "telegram",
+            Some(&policy)
+        )
+        .is_ok());
+
+        let denied = runtime_command_policy_check(
+            &ChannelRuntimeCommand::ApproveTool("shell".to_string()),
+            "telegram",
+            Some(&policy),
+        )
+        .expect_err("approve should be denied by allowed list");
+        assert!(denied.contains("/approve"));
+    }
+
+    #[test]
+    fn runtime_command_policy_check_blocks_config_write_commands() {
+        let policy = crate::config::ChannelCommandPolicyConfig {
+            native: true,
+            allowed: Vec::new(),
+            config_writes: false,
+        };
+        let denied = runtime_command_policy_check(
+            &ChannelRuntimeCommand::ApproveTool("shell".to_string()),
+            "telegram",
+            Some(&policy),
+        )
+        .expect_err("approve should be denied when config_writes=false");
+        assert!(denied.contains("config-write commands are disabled"));
+    }
+
+    #[test]
     fn context_window_overflow_error_detector_matches_known_messages() {
         let overflow_err = anyhow::anyhow!(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
@@ -5517,6 +5771,8 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -5571,6 +5827,8 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -5628,6 +5886,8 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -5846,6 +6106,18 @@ mod tests {
     }
 
     struct ToolCallingProvider;
+
+    fn approval_manager_with_auto_approved_mock_price() -> Arc<ApprovalManager> {
+        let mut autonomy_cfg = crate::config::AutonomyConfig::default();
+        if !autonomy_cfg
+            .auto_approve
+            .iter()
+            .any(|tool| tool == "mock_price")
+        {
+            autonomy_cfg.auto_approve.push("mock_price".to_string());
+        }
+        Arc::new(ApprovalManager::from_config(&autonomy_cfg))
+    }
 
     fn tool_call_payload() -> String {
         r#"<tool_call>
@@ -6226,9 +6498,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(vec!["mock_price".to_string()])),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -6301,9 +6573,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -6365,9 +6637,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -6441,13 +6713,13 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
         });
 
         process_channel_message(
@@ -6518,13 +6790,13 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
         });
 
         process_channel_message(
@@ -6591,9 +6863,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -6655,9 +6927,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -6728,9 +7000,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -6765,6 +7037,86 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_enforces_command_policy_allowed_list() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let mut command_policies = HashMap::new();
+        command_policies.insert(
+            "telegram".to_string(),
+            crate::config::ChannelCommandPolicyConfig {
+                native: true,
+                allowed: vec!["new".to_string()],
+                config_writes: true,
+            },
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies,
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-cmd-policy-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/approvals".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("not allowed on channel `telegram`"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -6832,6 +7184,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(vec!["mock_price".to_string()])),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
         assert_eq!(
@@ -6982,6 +7336,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
         assert_eq!(
@@ -7092,6 +7448,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager,
         });
 
@@ -7197,6 +7555,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(vec!["shell".to_string()])),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager,
         });
 
@@ -7293,6 +7653,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(vec!["mock_price".to_string()])),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
 
@@ -7439,9 +7801,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
             .await
@@ -7533,6 +7895,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
 
@@ -7678,6 +8042,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
 
@@ -7793,6 +8159,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
 
@@ -7888,6 +8256,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
 
@@ -8002,6 +8372,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
         });
 
@@ -8117,9 +8489,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -8193,9 +8565,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -8285,9 +8657,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -8430,6 +8802,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -8533,9 +8907,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -8598,9 +8972,9 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
-            approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
-            )),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
+            approval_manager: approval_manager_with_auto_approved_mock_price(),
         });
 
         process_channel_message(
@@ -8775,6 +9149,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -8860,6 +9236,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -8957,6 +9335,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -9036,6 +9416,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -9100,6 +9482,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -9483,6 +9867,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn conversation_memory_key_uses_message_id() {
+        let session = crate::config::SessionConfig::default();
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
             sender: "U123".into(),
@@ -9493,11 +9878,15 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
         };
 
-        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+        assert_eq!(
+            conversation_memory_key(&msg, &session),
+            "slack_U123_msg_abc123"
+        );
     }
 
     #[test]
     fn conversation_memory_key_is_unique_per_message() {
+        let session = crate::config::SessionConfig::default();
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
@@ -9518,13 +9907,76 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         assert_ne!(
-            conversation_memory_key(&msg1),
-            conversation_memory_key(&msg2)
+            conversation_memory_key(&msg1, &session),
+            conversation_memory_key(&msg2, &session)
+        );
+    }
+
+    #[test]
+    fn conversation_history_key_defaults_to_legacy_thread_scope() {
+        let session = crate::config::SessionConfig::default();
+        let msg = traits::ChannelMessage {
+            id: "msg_thread".into(),
+            sender: "U123".into(),
+            reply_target: "C456".into(),
+            content: "hello".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: Some("thread-99".into()),
+        };
+
+        assert_eq!(
+            conversation_history_key(&msg, &session),
+            "slack_thread-99_U123"
+        );
+    }
+
+    #[test]
+    fn conversation_history_key_prefers_channel_scoped_identity_link() {
+        let mut session = crate::config::SessionConfig::default();
+        session.history_scope = crate::config::SessionHistoryScope::PerPeer;
+        session
+            .identity_links
+            .insert("slack:U123".into(), "alice".into());
+        session.identity_links.insert("U123".into(), "bob".into());
+
+        let msg = traits::ChannelMessage {
+            id: "msg".into(),
+            sender: "U123".into(),
+            reply_target: "C456".into(),
+            content: "hello".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        assert_eq!(conversation_history_key(&msg, &session), "alice");
+    }
+
+    #[test]
+    fn conversation_history_key_per_account_channel_peer_includes_reply_target() {
+        let mut session = crate::config::SessionConfig::default();
+        session.history_scope = crate::config::SessionHistoryScope::PerAccountChannelPeer;
+        session.identity_links.insert("U123".into(), "alice".into());
+        let msg = traits::ChannelMessage {
+            id: "msg".into(),
+            sender: "U123".into(),
+            reply_target: "workspace-42".into(),
+            content: "hello".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            thread_ts: Some("thread-1".into()),
+        };
+
+        assert_eq!(
+            conversation_history_key(&msg, &session),
+            "telegram_workspace-42_alice"
         );
     }
 
     #[tokio::test]
     async fn autosave_keys_preserve_multiple_conversation_facts() {
+        let session = crate::config::SessionConfig::default();
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
 
@@ -9548,7 +10000,7 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         mem.store(
-            &conversation_memory_key(&msg1),
+            &conversation_memory_key(&msg1, &session),
             &msg1.content,
             MemoryCategory::Conversation,
             None,
@@ -9556,7 +10008,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .unwrap();
         mem.store(
-            &conversation_memory_key(&msg2),
+            &conversation_memory_key(&msg2, &session),
             &msg2.content,
             MemoryCategory::Conversation,
             None,
@@ -9621,6 +10073,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -9711,6 +10165,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -9750,7 +10206,11 @@ BTC is currently around $65,000 based on latest tool output."#
             .get("test-channel_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "hello");
+        assert!(
+            turns[0].content.ends_with("hello"),
+            "user content should preserve message body, got: {}",
+            turns[0].content
+        );
         assert!(!turns[0].content.contains("[Memory context]"));
     }
 
@@ -9801,6 +10261,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -10505,6 +10967,8 @@ BTC is currently around $65,000 based on latest tool output."#;
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -10576,6 +11040,8 @@ BTC is currently around $65,000 based on latest tool output."#;
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
+            session: crate::config::SessionConfig::default(),
+            command_policies: HashMap::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
                 &crate::config::AutonomyConfig::default(),
             )),
@@ -10634,7 +11100,11 @@ BTC is currently around $65,000 based on latest tool output."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(
+            turns[0].content.ends_with("What is WAL?"),
+            "user content should preserve text turn, got: {}",
+            turns[0].content
+        );
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
         assert!(
