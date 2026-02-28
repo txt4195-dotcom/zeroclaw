@@ -11,6 +11,12 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/build-spore.yml'
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: 'Build without Docker cache'
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -44,5 +50,5 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:spore
-          cache-from: type=gha
+          cache-from: ${{ github.event.inputs.no_cache == 'true' && '' || 'type=gha' }}
           cache-to: type=gha,mode=max
