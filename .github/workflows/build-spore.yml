@@ -5,12 +5,12 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile'
-      - 'config.spore.toml'
       - 'start-spore.sh'
       - 'nginx-spore.conf'
       - 'src/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - '.github/workflows/build-spore.yml'
 
 env:
   REGISTRY: ghcr.io
@@ -26,15 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract commit SHA
-        run: echo "SHORT_SHA=${GITHUB_SHA}" >> "$GITHUB_ENV"
 
       - name: Build and push spore image
         uses: docker/build-push-action@v6
@@ -44,4 +44,5 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:spore
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:spore-${{ env.SHORT_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
