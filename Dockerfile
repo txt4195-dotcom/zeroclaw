@@ -7,8 +7,8 @@ WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES=""
 
 # Install build dependencies
-RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt \
-    --mount=type=cache,id=apt-lib,target=/var/lib/apt \
+RUN --mount=type=cache,id=s/485e8dc9-d46b-4aaf-99af-abcba3bf8403-apt-cache,target=/var/cache/apt \
+    --mount=type=cache,id=s/485e8dc9-d46b-4aaf-99af-abcba3bf8403-apt-lib,target=/var/lib/apt \
     apt-get update && apt-get install -y \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -21,9 +21,9 @@ RUN mkdir -p src benches crates/robot-kit/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target \
+RUN --mount=type=cache,id=s/485e8dc9-d46b-4aaf-99af-abcba3bf8403-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=s/485e8dc9-d46b-4aaf-99af-abcba3bf8403-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=s/485e8dc9-d46b-4aaf-99af-abcba3bf8403-target,target=/app/target \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
       cargo build --release --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
@@ -55,9 +55,9 @@ RUN mkdir -p web/dist && \
         '  </body>' \
         '</html>' > web/dist/index.html; \
     fi
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target \
+RUN --mount=type=cache,id=s/485e8dc9-d46b-4aaf-99af-abcba3bf8403-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=s/485e8dc9-d46b-4aaf-99af-abcba3bf8403-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=s/485e8dc9-d46b-4aaf-99af-abcba3bf8403-target,target=/app/target \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
       cargo build --release --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
