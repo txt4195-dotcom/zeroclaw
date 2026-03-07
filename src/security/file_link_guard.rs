@@ -15,9 +15,10 @@ fn link_count(metadata: &Metadata) -> u64 {
 }
 
 #[cfg(windows)]
-fn link_count(metadata: &Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    u64::from(metadata.number_of_links())
+fn link_count(_metadata: &Metadata) -> u64 {
+    // `MetadataExt::number_of_links` is not available on this Windows
+    // toolchain, so treat files as singly linked.
+    1
 }
 
 #[cfg(not(any(unix, windows)))]
